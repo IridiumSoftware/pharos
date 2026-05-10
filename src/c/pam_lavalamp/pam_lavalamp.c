@@ -70,8 +70,11 @@
 #include <time.h>
 #include <unistd.h>
 
-#include <openssl/hmac.h>
+#include <openssl/bn.h>
+#include <openssl/ec.h>
+#include <openssl/ecdsa.h>
 #include <openssl/evp.h>
+#include <openssl/obj_mac.h>
 
 #define STALE_THRESHOLD_S    30      /* heartbeat older than this → REJECT */
 #define IPC_TIMEOUT_S        2       /* socket connect/read timeout */
@@ -84,12 +87,13 @@
 #define SYSTEM_VERIFY_PUB    "/var/run/lavalamp/verify.pub"
 #define USER_VERIFY_PUB_REL  ".lavalamp/verify.pub"
 
-#define IPC_VERSION          0x03
+#define IPC_VERSION          0x04
 #define IPC_REQUEST_LEN      17     /* 1 version + 16 nonce */
 #define IPC_RESPONSE_LEN     74     /* 1 version + 1 result + 8 ts + 64 sig */
 #define IPC_NONCE_LEN        16
-#define IPC_SIG_LEN          64
-#define IPC_KEY_LEN          32     /* Ed25519 raw public key (and signature payload) */
+#define IPC_SIG_LEN          64     /* ECDSA P-256 raw r||s */
+#define IPC_RAW_FIELD_LEN    32     /* r and s are each 32 bytes */
+#define IPC_PUB_LEN          33     /* SEC1 compressed P-256 point */
 
 #define MAX_PATH             4096
 
@@ -135,7 +139,7 @@ static int resolve_user_path(const char *username,
 }
 
 /*
- * Result codes from try_ipc_query_v3.
+ * Result codes from try_ipc_query_v4.
  */
 #define IPC_RESULT_ACCEPT   1   /* daemon returned 'A' + valid signature */
 #define IPC_RESULT_REJECT   0   /* daemon returned 'R' */
@@ -144,18 +148,105 @@ static int resolve_user_path(const char *username,
 #define IPC_RESULT_ERROR   -3   /* protocol error / signature invalid / nonce wrong */
 
 /*
- * read_pubkey_file — reads the 32-byte Ed25519 public key from
- * `path` into `out`. Returns 0 on success, non-zero on failure.
+ * read_pubkey_file — reads the 33-byte SEC1-compressed
+ * ECDSA P-256 public key from `path` into `out`. Returns 0 on
+ * success, non-zero on failure.
  */
-static int read_pubkey_file(const char *path, unsigned char out[IPC_KEY_LEN])
+static int read_pubkey_file(const char *path, unsigned char out[IPC_PUB_LEN])
 {
     int fd = open(path, O_RDONLY);
     if (fd < 0) {
         return -1;
     }
-    ssize_t n = read(fd, out, IPC_KEY_LEN);
+    ssize_t n = read(fd, out, IPC_PUB_LEN);
     close(fd);
-    return (n == IPC_KEY_LEN) ? 0 : -1;
+    return (n == IPC_PUB_LEN) ? 0 : -1;
+}
+
+/*
+ * pubkey_compressed_to_evp — wraps a 33-byte SEC1-compressed
+ * P-256 public key in an EVP_PKEY for use with EVP_DigestVerify.
+ * Returns NULL on failure; caller must EVP_PKEY_free non-NULL
+ * results.
+ */
+static EVP_PKEY *pubkey_compressed_to_evp(const unsigned char *pub33)
+{
+    EC_GROUP *group = EC_GROUP_new_by_curve_name(NID_X9_62_prime256v1);
+    if (group == NULL) return NULL;
+
+    EC_POINT *point = EC_POINT_new(group);
+    if (point == NULL) {
+        EC_GROUP_free(group);
+        return NULL;
+    }
+
+    EC_KEY *eckey = NULL;
+    EVP_PKEY *pkey = NULL;
+    BN_CTX *ctx = BN_CTX_new();
+    if (ctx == NULL) goto cleanup;
+
+    if (EC_POINT_oct2point(group, point, pub33, IPC_PUB_LEN, ctx) != 1) {
+        goto cleanup;
+    }
+
+    eckey = EC_KEY_new();
+    if (eckey == NULL) goto cleanup;
+    if (EC_KEY_set_group(eckey, group) != 1) goto cleanup;
+    if (EC_KEY_set_public_key(eckey, point) != 1) goto cleanup;
+
+    pkey = EVP_PKEY_new();
+    if (pkey == NULL) goto cleanup;
+    if (EVP_PKEY_assign_EC_KEY(pkey, eckey) != 1) {
+        EVP_PKEY_free(pkey);
+        pkey = NULL;
+        goto cleanup;
+    }
+    eckey = NULL;   /* ownership transferred to pkey */
+
+cleanup:
+    if (eckey != NULL) EC_KEY_free(eckey);
+    if (point != NULL) EC_POINT_free(point);
+    if (group != NULL) EC_GROUP_free(group);
+    if (ctx != NULL) BN_CTX_free(ctx);
+    return pkey;
+}
+
+/*
+ * raw_to_der_ecdsa — converts a 64-byte raw ECDSA signature
+ * (32-byte r || 32-byte s) into an ASN.1 DER-encoded ECDSA_SIG
+ * suitable for EVP_DigestVerify. Returns malloc'd buffer (caller
+ * must OPENSSL_free), with *out_len set; or NULL on failure.
+ */
+static unsigned char *raw_to_der_ecdsa(const unsigned char *raw64, int *out_len)
+{
+    BIGNUM *r = BN_bin2bn(raw64, IPC_RAW_FIELD_LEN, NULL);
+    BIGNUM *s = BN_bin2bn(raw64 + IPC_RAW_FIELD_LEN, IPC_RAW_FIELD_LEN, NULL);
+    if (r == NULL || s == NULL) {
+        if (r) BN_free(r);
+        if (s) BN_free(s);
+        return NULL;
+    }
+
+    ECDSA_SIG *sig = ECDSA_SIG_new();
+    if (sig == NULL) {
+        BN_free(r); BN_free(s);
+        return NULL;
+    }
+    /* ECDSA_SIG_set0 takes ownership of r and s. */
+    if (ECDSA_SIG_set0(sig, r, s) != 1) {
+        BN_free(r); BN_free(s);
+        ECDSA_SIG_free(sig);
+        return NULL;
+    }
+
+    unsigned char *der = NULL;
+    int der_len = i2d_ECDSA_SIG(sig, &der);
+    ECDSA_SIG_free(sig);
+    if (der_len < 0 || der == NULL) {
+        return NULL;
+    }
+    *out_len = der_len;
+    return der;
 }
 
 /*
@@ -195,15 +286,15 @@ static int write_full(int fd, const void *buf, size_t n)
 }
 
 /*
- * try_ipc_query_v3 — LL-042 v3 protocol client (Ed25519
+ * try_ipc_query_v4 — LL-043 v4 protocol client (ECDSA P-256
  * asymmetric-signature challenge-response).
  *
- * Reads the 32-byte daemon public key from `pubkey_path`,
- * opens an AF_UNIX connection to `sock_path`, sends a 17-byte
- * request (version 0x03 + 16-byte nonce from /dev/urandom),
- * reads a 74-byte response, validates: response version,
- * timestamp freshness, Ed25519 signature over
- * (nonce ‖ result ‖ timestamp) against the public key.
+ * Reads the 33-byte SEC1-compressed daemon public key from
+ * `pubkey_path`, opens an AF_UNIX connection to `sock_path`,
+ * sends a 17-byte request (version 0x04 + 16-byte nonce from
+ * /dev/urandom), reads a 74-byte response, validates: version,
+ * timestamp freshness, ECDSA P-256 signature over
+ * SHA-256(nonce ‖ result ‖ timestamp) against the public key.
  * Returns one of the IPC_RESULT_* codes.
  *
  * Validation order is strict — any failure returns either
@@ -211,12 +302,11 @@ static int write_full(int fd, const void *buf, size_t n)
  * heartbeat path) or IPC_RESULT_ERROR (signature invalid /
  * stale timestamp / malformed → fail closed, no fallback).
  *
- * Unlike LL-041 HMAC, the client does not need any secret —
- * only the daemon's public key, which is mode 0644 (world-
- * readable). Verification capability can be distributed
- * widely without expanding the forge-capable surface.
+ * The wire format uses raw 64-byte r||s; we convert to DER
+ * internally for OpenSSL's EVP_DigestVerify which expects
+ * ECDSA signatures DER-encoded.
  */
-static int try_ipc_query_v3(const char *sock_path, const char *pubkey_path)
+static int try_ipc_query_v4(const char *sock_path, const char *pubkey_path)
 {
     /* Quick sanity: socket file must exist + be a socket. */
     struct stat st;
@@ -224,8 +314,8 @@ static int try_ipc_query_v3(const char *sock_path, const char *pubkey_path)
         return IPC_RESULT_NOSOCK;
     }
 
-    /* Read daemon public key. Missing → NOSOCK (fall back). */
-    unsigned char pubkey_raw[IPC_KEY_LEN];
+    /* Read daemon public key (33 bytes SEC1-compressed). */
+    unsigned char pubkey_raw[IPC_PUB_LEN];
     if (read_pubkey_file(pubkey_path, pubkey_raw) != 0) {
         return IPC_RESULT_NOSOCK;
     }
@@ -269,7 +359,7 @@ static int try_ipc_query_v3(const char *sock_path, const char *pubkey_path)
         return IPC_RESULT_ERROR;
     }
 
-    /* Read 74-byte response: version + result + ts(8) + sig(64). */
+    /* Read 74-byte response: version + result + ts(8) + sig(64 raw). */
     unsigned char response[IPC_RESPONSE_LEN];
     if (read_full(sock, response, IPC_RESPONSE_LEN) != 0) {
         close(sock);
@@ -291,7 +381,7 @@ static int try_ipc_query_v3(const char *sock_path, const char *pubkey_path)
     int64_t skew = now_ts - daemon_ts;
     if (skew < 0) skew = -skew;
     if (skew > IPC_TS_SKEW_S) {
-        return IPC_RESULT_ERROR;   /* timestamp not fresh */
+        return IPC_RESULT_ERROR;
     }
 
     /* Build the signed message: (nonce ‖ result ‖ timestamp). */
@@ -300,34 +390,38 @@ static int try_ipc_query_v3(const char *sock_path, const char *pubkey_path)
     signed_msg[IPC_NONCE_LEN] = result_byte;
     memcpy(signed_msg + IPC_NONCE_LEN + 1, response + 2, 8);
 
-    /* Build EVP_PKEY from the raw 32-byte public key. */
-    EVP_PKEY *pkey = EVP_PKEY_new_raw_public_key(
-        EVP_PKEY_ED25519, NULL, pubkey_raw, IPC_KEY_LEN);
+    /* Wrap the 33-byte compressed public key in an EVP_PKEY. */
+    EVP_PKEY *pkey = pubkey_compressed_to_evp(pubkey_raw);
     if (pkey == NULL) {
         return IPC_RESULT_ERROR;
     }
 
-    /* Verify the 64-byte Ed25519 signature. */
-    EVP_MD_CTX *mctx = EVP_MD_CTX_new();
-    if (mctx == NULL) {
+    /* Convert raw r||s signature to DER for EVP_DigestVerify. */
+    int der_len = 0;
+    unsigned char *der_sig = raw_to_der_ecdsa(response + 10, &der_len);
+    if (der_sig == NULL) {
         EVP_PKEY_free(pkey);
         return IPC_RESULT_ERROR;
     }
-    int verify_init_rc = EVP_DigestVerifyInit(mctx, NULL, NULL, NULL, pkey);
+
+    /* Verify ECDSA P-256 signature over SHA-256(signed_msg). */
+    EVP_MD_CTX *mctx = EVP_MD_CTX_new();
     int verify_rc = -1;
-    if (verify_init_rc == 1) {
-        verify_rc = EVP_DigestVerify(mctx,
-                                      response + 10, IPC_SIG_LEN,
-                                      signed_msg, sizeof(signed_msg));
+    if (mctx != NULL) {
+        if (EVP_DigestVerifyInit(mctx, NULL, EVP_sha256(), NULL, pkey) == 1) {
+            verify_rc = EVP_DigestVerify(mctx,
+                                          der_sig, (size_t)der_len,
+                                          signed_msg, sizeof(signed_msg));
+        }
+        EVP_MD_CTX_free(mctx);
     }
-    EVP_MD_CTX_free(mctx);
+    OPENSSL_free(der_sig);
     EVP_PKEY_free(pkey);
 
     if (verify_rc != 1) {
         return IPC_RESULT_ERROR;   /* signature invalid — forge or tamper */
     }
 
-    /* Signature valid + timestamp fresh + nonce binds → trust the result. */
     switch (result_byte) {
     case 'A': return IPC_RESULT_ACCEPT;
     case 'R': return IPC_RESULT_REJECT;
@@ -359,7 +453,7 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh,
     /* ─── MVP-4 / LL-042: try v3 (Ed25519 asymmetric) first ─── */
 
     /* Try system-mode v3 first. */
-    int ipc_result = try_ipc_query_v3(SYSTEM_VERIFY_SOCK,
+    int ipc_result = try_ipc_query_v4(SYSTEM_VERIFY_SOCK,
                                        SYSTEM_VERIFY_PUB);
     const char *ipc_path = SYSTEM_VERIFY_SOCK;
 
@@ -371,7 +465,7 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh,
                                user_sock, sizeof(user_sock)) == 0 &&
             resolve_user_path(username, USER_VERIFY_PUB_REL,
                                user_pub, sizeof(user_pub)) == 0) {
-            ipc_result = try_ipc_query_v3(user_sock, user_pub);
+            ipc_result = try_ipc_query_v4(user_sock, user_pub);
             ipc_path = user_sock;
         }
     }
@@ -379,25 +473,25 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh,
     switch (ipc_result) {
     case IPC_RESULT_ACCEPT:
         pam_syslog(pamh, LOG_INFO,
-                   "pam_lavalamp: LL-042 v3 IPC at %s returned 'A' "
-                   "(cached ACCEPT, Ed25519 sig valid, nonce binds) → admit",
+                   "pam_lavalamp: LL-043 v4 IPC at %s returned 'A' "
+                   "(cached ACCEPT, ECDSA P-256 sig valid, nonce binds) → admit",
                    ipc_path);
         return PAM_SUCCESS;
     case IPC_RESULT_REJECT:
         pam_syslog(pamh, LOG_NOTICE,
-                   "pam_lavalamp: LL-042 v3 IPC at %s returned 'R' "
+                   "pam_lavalamp: LL-043 v4 IPC at %s returned 'R' "
                    "(cached REJECT) → reject", ipc_path);
         return PAM_AUTH_ERR;
     case IPC_RESULT_STALE:
         pam_syslog(pamh, LOG_NOTICE,
-                   "pam_lavalamp: LL-042 v3 IPC at %s returned 'S' "
+                   "pam_lavalamp: LL-043 v4 IPC at %s returned 'S' "
                    "(cache stale or pre-first-verify) → reject",
                    ipc_path);
         return PAM_AUTH_ERR;
     case IPC_RESULT_ERROR:
         pam_syslog(pamh, LOG_NOTICE,
-                   "pam_lavalamp: LL-042 v3 IPC protocol error at %s "
-                   "(Ed25519 signature invalid / stale ts / "
+                   "pam_lavalamp: LL-043 v4 IPC protocol error at %s "
+                   "(ECDSA P-256 signature invalid / stale ts / "
                    "malformed response) → reject (no fallback; "
                    "daemon is reachable but the integrity check "
                    "failed — possible tamper)", ipc_path);

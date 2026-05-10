@@ -20,6 +20,15 @@ identity claims and impermeable to spoofed ones).
 
 ## Status
 
+**v0.0.5 — MVP-5 ECDSA P-256 protocol upgrade.** Same
+asymmetric-signing posture as v0.0.4, but on a curve
+compatible with both Apple Secure Enclave and TPM 2.0 —
+unblocks future SE/TPM2 hardware binding without further
+protocol changes. Wire format speaks **LL-043 v4**: 17-byte
+challenge (`0x04` + nonce), 74-byte response (version +
+result + 8-byte timestamp + 64-byte raw r‖s ECDSA P-256
+signature). Public key file is 33 bytes (SEC1-compressed).
+
 **v0.0.4 — MVP-4 asymmetric signing.** A reference Linux PAM
 module that gates session authentication on the LavaLamp
 daemon's substrate-bound verify result, with **Ed25519

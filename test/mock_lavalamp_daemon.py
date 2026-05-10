@@ -1,25 +1,24 @@
 #!/usr/bin/env python3
 """
 mock_lavalamp_daemon.py — minimal AF_UNIX socket server that
-mimics the LavaLamp daemon's LL-042 v3 IPC contract (Ed25519
+mimics the LavaLamp daemon's LL-043 v4 IPC contract (ECDSA P-256
 asymmetric-signature challenge-response).
 
-Used by test_pam_lavalamp.sh to exercise the MVP-4 IPC
+Used by test_pam_lavalamp.sh to exercise the MVP-5 IPC
 protocol without requiring a running Julia LavaLamp daemon.
-On each connection, reads a 17-byte v3 request (version 0x03 +
+On each connection, reads a 17-byte v4 request (version 0x04 +
 nonce), responds with 74 bytes (version + result + 8-byte LE
-timestamp + 64-byte Ed25519 signature over
-`nonce ‖ result ‖ timestamp`).
+timestamp + 64-byte raw ECDSA P-256 signature over
+SHA-256(nonce ‖ result ‖ timestamp)).
 
 Usage:
     mock_lavalamp_daemon.py <socket-path> <pubkey-path> <response-char> [--ts-skew SECONDS]
 
   socket-path     path to AF_UNIX listener (created mode 0600).
-  pubkey-path     path to write the 32-byte raw Ed25519
-                  public key (created mode 0644 — world-
-                  readable; matches LL-042 contract).
-  response-char   one of 'A' / 'R' / 'S' (LL-040/041/042
-                  protocol).
+  pubkey-path     path to write the 33-byte SEC1-compressed
+                  ECDSA P-256 public key (mode 0644 — world-
+                  readable; matches LL-043 contract).
+  response-char   one of 'A' / 'R' / 'S'.
   --ts-skew N     (optional) bias daemon timestamp by N seconds
                   for testing client freshness checks. Default 0.
 
@@ -27,8 +26,6 @@ Runs until killed (SIGINT/SIGTERM). Cleans up socket + pubkey
 files on exit.
 
 Requires: cryptography library (`pip install cryptography`).
-ubuntu-latest: `python3 -m pip install cryptography` (typically
-pre-installed in 24.04+).
 """
 
 import argparse
@@ -39,12 +36,12 @@ import struct
 import sys
 import time
 
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature
+from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.serialization import (
     Encoding,
-    PrivateFormat,
     PublicFormat,
-    NoEncryption,
 )
 
 
@@ -62,17 +59,19 @@ def main() -> None:
 
     response_byte = args.response_char.encode("ascii")
 
-    # Generate Ed25519 keypair.
-    priv = Ed25519PrivateKey.generate()
+    # Generate ECDSA P-256 keypair.
+    priv = ec.generate_private_key(ec.SECP256R1())
     pub = priv.public_key()
-    pub_raw = pub.public_bytes(Encoding.Raw, PublicFormat.Raw)
-    assert len(pub_raw) == 32
+
+    # Export public key as 33-byte SEC1-compressed point.
+    pub_compressed = pub.public_bytes(Encoding.X962, PublicFormat.CompressedPoint)
+    assert len(pub_compressed) == 33
 
     # Write public key (mode 0644 — world-readable; clients verify
     # without needing any secret).
     fd = os.open(args.pubkey_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
     try:
-        os.write(fd, pub_raw)
+        os.write(fd, pub_compressed)
     finally:
         os.close(fd)
 
@@ -97,7 +96,7 @@ def main() -> None:
     signal.signal(signal.SIGTERM, cleanup)
     signal.signal(signal.SIGINT, cleanup)
 
-    print(f"mock daemon v3: socket={args.socket_path}, "
+    print(f"mock daemon v4: socket={args.socket_path}, "
           f"pubkey={args.pubkey_path}, response='{args.response_char}', "
           f"ts_skew={args.ts_skew}s", flush=True)
 
@@ -106,7 +105,7 @@ def main() -> None:
             client, _ = server.accept()
             try:
                 client.settimeout(2.0)
-                # Read 17-byte v3 request.
+                # Read 17-byte v4 request.
                 request = b""
                 while len(request) < 17:
                     chunk = client.recv(17 - len(request))
@@ -115,7 +114,7 @@ def main() -> None:
                     request += chunk
                 if len(request) != 17:
                     continue
-                if request[0] != 0x03:
+                if request[0] != 0x04:
                     continue   # unsupported version
                 nonce = request[1:17]
 
@@ -123,10 +122,18 @@ def main() -> None:
                 ts = int(time.time()) + args.ts_skew
                 ts_bytes = struct.pack("<q", ts)
                 signed = nonce + response_byte + ts_bytes
-                sig = priv.sign(signed)
+
+                # ECDSA P-256 signature over SHA-256(signed).
+                # cryptography's sign() with ECDSA(SHA256) returns
+                # DER. Convert to raw 64-byte r||s.
+                der_sig = priv.sign(signed, ec.ECDSA(hashes.SHA256()))
+                r, s = decode_dss_signature(der_sig)
+                r_bytes = r.to_bytes(32, "big")
+                s_bytes = s.to_bytes(32, "big")
+                sig = r_bytes + s_bytes
                 assert len(sig) == 64
 
-                response = bytes([0x03]) + response_byte + ts_bytes + sig
+                response = bytes([0x04]) + response_byte + ts_bytes + sig
                 assert len(response) == 74
                 client.sendall(response)
             except (socket.timeout, BlockingIOError, ConnectionError):
