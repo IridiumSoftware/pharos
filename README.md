@@ -20,42 +20,51 @@ identity claims and impermeable to spoofed ones).
 
 ## Status
 
-**v0.0.3 — MVP-3 anti-replay subset.** A reference Linux PAM
+**v0.0.4 — MVP-4 asymmetric signing.** A reference Linux PAM
 module that gates session authentication on the LavaLamp
-daemon's substrate-bound verify result, with HMAC-SHA256
-challenge-response protection against capture-and-replay and
-same-process-tier MITM forgery.
+daemon's substrate-bound verify result, with **Ed25519
+asymmetric-signature** challenge-response. The architectural
+step over v0.0.3: client no longer holds a secret. Daemon
+holds private key; clients read public key only.
 
-The PAM module speaks the **LL-041 v2 protocol**:
+The PAM module speaks the **LL-042 v3 protocol**:
 
-1. Reads the 32-byte shared secret from
-   `/var/run/lavalamp/verify.secret` (mode 0600).
+1. Reads the 32-byte daemon **public key** from
+   `/var/run/lavalamp/verify.pub` (mode 0644 — world-
+   readable; verification capability does not require
+   secret-holding).
 2. Generates a 16-byte random nonce per request.
-3. Sends a 17-byte challenge (`0x02 + nonce`).
-4. Receives a 42-byte response (version + result + 8-byte
-   daemon timestamp + 32-byte HMAC over
+3. Sends a 17-byte challenge (`0x03 + nonce`).
+4. Receives a 74-byte response (version + result + 8-byte
+   daemon timestamp + **64-byte Ed25519 signature** over
    `nonce ‖ result ‖ timestamp`).
-5. Validates: HMAC matches via constant-time compare,
-   timestamp within ±30 s of current time, version correct.
+5. Validates: signature against the public key via
+   OpenSSL `EVP_DigestVerify`; timestamp within ±30 s of
+   current time; version correct.
 6. Gates on result byte if all validations pass.
 
-Result-byte semantics (LL-040/041):
-- `'A'` (ACCEPT, fresh) + valid HMAC → `PAM_SUCCESS`
-- `'R'` (REJECT) + valid HMAC → `PAM_AUTH_ERR`
-- `'S'` (STALE) + valid HMAC → `PAM_AUTH_ERR`
-- HMAC mismatch / stale timestamp / wrong version → `PAM_AUTH_ERR`
-  (no fallback; possible tamper signal)
-- socket *or* secret file missing → fall back to **MVP-1**
-  heartbeat liveness gate via LL-039
+Result-byte semantics (LL-040/041/042):
+- `'A'` (ACCEPT, fresh) + valid Ed25519 signature →
+  `PAM_SUCCESS`
+- `'R'` (REJECT) + valid signature → `PAM_AUTH_ERR`
+- `'S'` (STALE) + valid signature → `PAM_AUTH_ERR`
+- signature invalid / stale timestamp / wrong version →
+  `PAM_AUTH_ERR` (no fallback; possible tamper signal)
+- socket *or* public-key file missing → fall back to
+  **MVP-1** heartbeat liveness gate via LL-039
 
-**Honest framing.** v0.0.3 defends three classes of attack:
+**Honest framing.** v0.0.4 defends four classes of attack:
 capture-and-replay (nonce binding), same-process-tier MITM
-forgery (HMAC + 0600 secret), and stale captured responses
-(timestamp freshness). It does NOT defend against same-UID
-attackers (root or daemon UID can read both socket and
-secret file → can forge any HMAC). TPM-bound asymmetric
-signing (deferred to **v0.0.6**, LL-022 strategy 1
-integration) closes that gap.
+forgery (signature can't be forged without private key),
+stale captured responses (timestamp freshness), and
+**public-key compromise → no forgery** (the asymmetric
+shape lets anyone verify, but only the daemon can sign).
+It does NOT defend against same-UID attackers (root or
+daemon UID can read `verify.priv` directly on disk → can
+forge any signature). TPM/Secure-Enclave key binding
+(deferred to **v0.0.7**, matching LavaLamp LL-043 / LL-044)
+closes that gap by moving the private key off-disk into a
+hardware-bound enclave.
 
 ## Position in the Triad Deployments
 
@@ -137,46 +146,50 @@ while testing.
 
 ## How does this protect against an attacker?
 
-**v0.0.3 / LL-041 v2 (this release).** The substrate-bound
-verify result traverses the auth flow with cryptographic
-integrity. Three defenses layer on top of MVP-2:
+**v0.0.4 / LL-042 v3 (this release).** Substrate-bound
+verify result traverses the auth flow with **asymmetric**
+cryptographic integrity. Four defenses now active:
 
 - **Capture-and-replay defended.** Client supplies a fresh
   16-byte random nonce per request; daemon binds the nonce
-  into the response HMAC. Captured responses can't be
-  replayed in a different session — the nonce won't match.
+  into the signed payload. Captured responses can't be
+  replayed in a different session.
 - **Same-process-tier MITM forgery defended.** Daemon
-  generates a 32-byte random secret on startup and writes
-  it to `verify.secret` (mode 0600). Both sides compute
-  HMAC-SHA256(secret, nonce ‖ result ‖ timestamp). An
-  unprivileged attacker (different UID) who somehow gains
-  socket access cannot read the secret file and so cannot
-  forge valid HMACs.
+  generates a 32-byte Ed25519 keypair on startup; writes
+  private to `verify.priv` (mode 0600) and public to
+  `verify.pub` (mode 0644). An unprivileged attacker who
+  gains socket access cannot read the private key file and
+  so cannot forge valid signatures. The signature is over
+  `nonce ‖ result ‖ timestamp` (25 bytes); recomputing it
+  without the private key requires breaking Ed25519.
 - **Stale captures defended.** Daemon includes its current
   Unix epoch second in the signed payload; client validates
   freshness within `IPC_TS_SKEW_S = 30s`.
+- **Public-key compromise → no forgery (NEW vs v0.0.3).**
+  Anyone can read `verify.pub` and verify; only the daemon
+  (with the private key) can sign. The asymmetric shape lets
+  verification capability be distributed widely (Lazarus,
+  future shims, third-party consumers) without expanding the
+  forge-capable surface.
 
-**MVP-2 fallback (v1 single-byte protocol):** superseded by
-v2 in v0.0.3. v1 daemons (LavaLamp v0.0.84) are NOT
-backward-compatible with v2 clients; a v0.0.3 PharOS PAM
-module talking to a v0.0.84 daemon will fail closed. Upgrade
-both sides together.
+**MVP-3 fallback (v2 HMAC):** superseded by v3 in v0.0.4. v2
+daemons (LavaLamp v0.0.85) are NOT backward-compatible with
+v3 clients; a v0.0.4 PharOS PAM module talking to a v0.0.85
+daemon will fail closed. Upgrade both sides together.
 
-**MVP-1 fallback (LL-039 heartbeat):** if the v2 socket OR
-secret file is missing, the module falls back to the
+**MVP-1 fallback (LL-039 heartbeat):** if the v3 socket OR
+public-key file is missing, the module falls back to the
 heartbeat-age gate. Raises the bar on credential-replay
-attacks but doesn't traverse the verify result — that's why
-v2 is the preferred path.
+attacks but doesn't traverse the verify result.
 
 **Not yet defended (load-bearing limit):** same-UID
-attackers (root or daemon UID) can read both the socket and
-the secret file, and therefore can forge any HMAC. This is
-the limit shared-secret HMAC reaches. **TPM-bound asymmetric
-signing** (deferred to **v0.0.6**, LL-022 strategy 1
-integration) replaces the shared secret with a TPM-private
-signing key + filesystem-public verification key — same-UID
-attackers can read the public key but cannot extract the
-private key. That's the next milestone.
+attackers (root or daemon UID) can read `verify.priv`
+directly on disk → can forge any signature. **TPM-bound
+key storage** (deferred to **v0.0.7**, matching LavaLamp
+LL-043 SE on Apple Silicon / LL-044 TPM2 on Linux) replaces
+the on-disk private key with a hardware-bound key that
+never leaves the secure element. Same wire format; only
+the key-storage layer swaps. That's the next milestone.
 
 **Out of scope (LavaLamp boundaries).** Kernel-level
 adversaries on the device (LL-015 permanent `:open`);
