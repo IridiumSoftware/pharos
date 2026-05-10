@@ -20,21 +20,30 @@ identity claims and impermeable to spoofed ones).
 
 ## Status
 
-**v0.0.1 — MVP-1 prototype-stage.** A reference Linux PAM module
-that gates session unlock on LavaLamp daemon liveness. This is
-the simplest credible first integration: it uses the same
-strict-LL-002 one-bit liveness channel that the LavaLamp menu-
-bar app uses (LL-039 heartbeat file at `~/.lavalamp/heartbeat`
-or `/var/run/lavalamp/heartbeat`). If the daemon is alive, the
-PAM module returns `PAM_SUCCESS`; if dead/stale, `PAM_AUTH_ERR`.
+**v0.0.2 — MVP-2 prototype-stage.** A reference Linux PAM
+module that gates session authentication on the LavaLamp
+daemon's **substrate-bound verify result**, not just
+liveness.
 
-**Honest framing.** MVP-1 gates on *liveness*, not on the
-verify *result* itself. An attacker who can run the LavaLamp
-daemon under a different envelope on different hardware
-defeats this layer alone. **MVP-2** (next milestone) closes
-this gap by integrating the daemon's verify ACCEPT/REJECT via
-a Unix-socket IPC channel, so PAM can gate on the actual
-substrate-bound proof.
+The PAM module connects to the daemon's LL-040 AF_UNIX socket
+(`/var/run/lavalamp/verify.sock` system-mode preferred,
+`~user/.lavalamp/verify.sock` user-mode fallback), reads a
+single response byte, and gates accordingly:
+
+- `'A'` (ACCEPT, fresh) → `PAM_SUCCESS`
+- `'R'` (REJECT, fresh) → `PAM_AUTH_ERR`
+- `'S'` (cache stale) → `PAM_AUTH_ERR`
+- socket missing → fall back to **MVP-1 (v0.0.1)** heartbeat
+  liveness gate via LL-039
+
+**Honest framing.** MVP-2 actually traverses the substrate-
+bound proof through to the auth result. An attacker who runs
+a LavaLamp daemon under a *different* envelope on *different*
+hardware is now caught: the daemon's `verify_full` fails →
+cache holds 'R' → PAM returns `PAM_AUTH_ERR`. **MVP-3** (next
+milestone, v0.0.5) adds anti-replay via session-binding
+tokens (TPM-bound signing keys per LL-022 strategy 1); MVP-2
+does not yet provide replay protection.
 
 ## Position in the Triad Deployments
 
@@ -50,34 +59,36 @@ tier. The threat-landscape companion in the LavaLamp repo
 canonical reference for the castle/membrane/immune-system
 framing PharOS instantiates.
 
-## What MVP-1 ships
+## What v0.0.2 ships
 
-- **`src/c/pam_lavalamp/`** — Linux PAM module. Single C file +
-  Makefile. Builds with `make` (requires `libpam0g-dev` on
+- **`src/c/pam_lavalamp/`** — Linux PAM module. Single C file
+  + Makefile. Builds with `make` (requires `libpam0g-dev` on
   Debian/Ubuntu). Installs to `/lib/x86_64-linux-gnu/security/`.
+  Implements MVP-2 IPC client (`try_ipc_query`) with MVP-1
+  heartbeat fallback.
+- **`test/mock_lavalamp_daemon.py`** — Python AF_UNIX mock
+  daemon for protocol fixture testing without requiring a
+  running Julia daemon.
 - **`test/test_pam_lavalamp.sh`** — integration test harness.
-  Exercises the module against synthetic heartbeat fixtures
-  (fresh / stale / missing) without requiring a running
-  LavaLamp daemon.
+  §1 MVP-1 heartbeat-age fixtures + §2 MVP-2 IPC protocol
+  fixtures + §3 module sanity.
 - **CI** on `ubuntu-latest`. Builds the module, runs the test
   harness on every push to master.
 
-## What MVP-1 does NOT ship
+## What v0.0.2 does NOT ship
 
-- **MVP-2 verify-result IPC.** Status: queued for v0.0.2.
-  Requires a Unix-socket between the PAM module (or a helper
-  helper-process) and the LavaLamp daemon, and a deliberate
-  LL-002 amendment for the verify result traversing a channel
-  beyond the daemon's stdout. The amendment will be a new spec
-  entry (PH-NNN) with its own threat-model justification.
-- **macOS Authorization Plugin.** Status: queued. Requires
-  Cocoa + private-API integration; harder build and
+- **Anti-replay (session-binding tokens).** Status: queued for
+  MVP-3 (v0.0.5). Requires TPM-bound signing keys (LL-022
+  strategy 1). An attacker who can read the LL-040 socket
+  once and replay the connection currently gets the same
+  byte response.
+- **macOS Authorization Plugin.** Status: queued for v0.0.3.
+  Requires Cocoa + private-API integration; harder build and
   code-signing pipeline.
-- **Windows Credential Provider.** Status: queued. WMI + COM
-  surface; deferred to last.
+- **Windows Credential Provider.** Status: queued for v0.0.4.
+  WMI + COM surface; deferred to last.
 - **Registration ceremony / revocation flow.** Status: queued
-  for MVP-3. Requires TPM-bound envelope storage (LL-022
-  strategy 1) + key-rotation primitives.
+  for MVP-3 (v0.0.5). Bundled with TPM-bound envelope store.
 
 ## Build + try
 
@@ -111,26 +122,27 @@ while testing.
 
 ## How does this protect against an attacker?
 
-**MVP-1 (this release):** raises the bar on credential-replay
-attacks. An attacker who steals your password / token / ssh
-key but doesn't have the LavaLamp daemon running on your
-substrate cannot complete a PAM auth flow that requires
-`pam_lavalamp.so`. They would need to *also* gain code
-execution on your machine to start the daemon — at which
-point they have the substrate, but the daemon's LavaLamp
-verify will fail because the chaotic process they're running
-on a different substrate diverges from your registered
-envelope. (MVP-2 makes this defense actually fire; MVP-1
-relies on the attacker not being able to spoof the heartbeat
-file.)
+**MVP-2 (this release):** the substrate-bound verify result
+actually traverses the auth flow. The PAM module reads the
+LL-040 IPC byte; the daemon's cached `verify_full` outcome
+gates `PAM_SUCCESS` / `PAM_AUTH_ERR`. An attacker who runs
+their own LavaLamp daemon under their own envelope on
+different hardware is caught: their daemon's verify returns
+REJECT against the registered envelope they don't have, the
+IPC byte is 'R', PAM denies. The substrate-bound proof
+defends here, not just the existence-bit.
 
-**MVP-2 (next):** the PAM module talks to the daemon over a
-Unix socket, gets the actual ACCEPT/REJECT for the current
-session, and passes through the substrate-bound proof.
-Attacker who runs their own LavaLamp daemon under their own
-envelope on different hardware is now caught: the verify
-returns REJECT against the registered envelope they don't
-have.
+**MVP-1 fallback:** if the LL-040 socket is unavailable, the
+module falls back to the LL-039 heartbeat-age gate. Raises
+the bar on credential-replay attacks (attacker needs the
+daemon running on the substrate) but doesn't actually
+traverse the verify result — that's the gap MVP-2 closes.
+
+**MVP-3 (next):** anti-replay via session-binding tokens.
+Without it, an attacker who can read the IPC byte once and
+replay the connection during a different session window gets
+the same byte response. Production deployments at higher
+threat tiers should wait for MVP-3 / TPM-bound signing keys.
 
 **Out of scope:** kernel-level adversaries on the device
 (LavaLamp LL-015 permanent `:open`); user-layer attacks
