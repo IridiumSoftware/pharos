@@ -1,17 +1,23 @@
-# pam_lavalamp Makefile — Linux PAM module build for PharOS MVP-1.
+# pam_lavalamp Makefile — Linux PAM module build for PharOS
+# MVP-1 + MVP-2 + MVP-3 (HMAC anti-replay).
 #
 # Build: make
 # Install: sudo make install
 # Test (without installing): make test  (uses test/test_pam_lavalamp.sh)
 #
-# Requires libpam0g-dev on Debian/Ubuntu (or pam-devel on
-# Fedora/RHEL). The PAM module is a position-independent shared
-# object loaded by libpam at runtime.
+# Requires:
+#   - libpam0g-dev (Debian/Ubuntu) or pam-devel (Fedora/RHEL)
+#   - libssl-dev (Debian/Ubuntu) or openssl-devel (Fedora/RHEL)
+#     for HMAC-SHA256 via libcrypto
+#
+# The PAM module is a position-independent shared object loaded
+# by libpam at runtime. Links against libpam (-lpam) and
+# libcrypto (-lcrypto, OpenSSL or LibreSSL).
 
 CC      ?= gcc
 CFLAGS  ?= -O2 -Wall -Wextra -Werror -fPIC -fstack-protector-strong
 LDFLAGS ?= -shared
-LIBS    := -lpam
+LIBS    := -lpam -lcrypto
 
 TARGET  := pam_lavalamp.so
 SOURCES := pam_lavalamp.c

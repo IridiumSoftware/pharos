@@ -20,30 +20,42 @@ identity claims and impermeable to spoofed ones).
 
 ## Status
 
-**v0.0.2 — MVP-2 prototype-stage.** A reference Linux PAM
+**v0.0.3 — MVP-3 anti-replay subset.** A reference Linux PAM
 module that gates session authentication on the LavaLamp
-daemon's **substrate-bound verify result**, not just
-liveness.
+daemon's substrate-bound verify result, with HMAC-SHA256
+challenge-response protection against capture-and-replay and
+same-process-tier MITM forgery.
 
-The PAM module connects to the daemon's LL-040 AF_UNIX socket
-(`/var/run/lavalamp/verify.sock` system-mode preferred,
-`~user/.lavalamp/verify.sock` user-mode fallback), reads a
-single response byte, and gates accordingly:
+The PAM module speaks the **LL-041 v2 protocol**:
 
-- `'A'` (ACCEPT, fresh) → `PAM_SUCCESS`
-- `'R'` (REJECT, fresh) → `PAM_AUTH_ERR`
-- `'S'` (cache stale) → `PAM_AUTH_ERR`
-- socket missing → fall back to **MVP-1 (v0.0.1)** heartbeat
-  liveness gate via LL-039
+1. Reads the 32-byte shared secret from
+   `/var/run/lavalamp/verify.secret` (mode 0600).
+2. Generates a 16-byte random nonce per request.
+3. Sends a 17-byte challenge (`0x02 + nonce`).
+4. Receives a 42-byte response (version + result + 8-byte
+   daemon timestamp + 32-byte HMAC over
+   `nonce ‖ result ‖ timestamp`).
+5. Validates: HMAC matches via constant-time compare,
+   timestamp within ±30 s of current time, version correct.
+6. Gates on result byte if all validations pass.
 
-**Honest framing.** MVP-2 actually traverses the substrate-
-bound proof through to the auth result. An attacker who runs
-a LavaLamp daemon under a *different* envelope on *different*
-hardware is now caught: the daemon's `verify_full` fails →
-cache holds 'R' → PAM returns `PAM_AUTH_ERR`. **MVP-3** (next
-milestone, v0.0.5) adds anti-replay via session-binding
-tokens (TPM-bound signing keys per LL-022 strategy 1); MVP-2
-does not yet provide replay protection.
+Result-byte semantics (LL-040/041):
+- `'A'` (ACCEPT, fresh) + valid HMAC → `PAM_SUCCESS`
+- `'R'` (REJECT) + valid HMAC → `PAM_AUTH_ERR`
+- `'S'` (STALE) + valid HMAC → `PAM_AUTH_ERR`
+- HMAC mismatch / stale timestamp / wrong version → `PAM_AUTH_ERR`
+  (no fallback; possible tamper signal)
+- socket *or* secret file missing → fall back to **MVP-1**
+  heartbeat liveness gate via LL-039
+
+**Honest framing.** v0.0.3 defends three classes of attack:
+capture-and-replay (nonce binding), same-process-tier MITM
+forgery (HMAC + 0600 secret), and stale captured responses
+(timestamp freshness). It does NOT defend against same-UID
+attackers (root or daemon UID can read both socket and
+secret file → can forge any HMAC). TPM-bound asymmetric
+signing (deferred to **v0.0.6**, LL-022 strategy 1
+integration) closes that gap.
 
 ## Position in the Triad Deployments
 
@@ -94,11 +106,14 @@ framing PharOS instantiates.
 
 ```bash
 # Linux (Ubuntu / Debian):
-sudo apt install libpam0g-dev build-essential
+sudo apt install libpam0g-dev libssl-dev build-essential
 cd src/c/pam_lavalamp
 make
 sudo make install
 ```
+
+`libssl-dev` is required for HMAC-SHA256 (LL-041 v2 protocol).
+Fedora/RHEL: `dnf install pam-devel openssl-devel`.
 
 Then add the module to a PAM service. For testing on a
 non-production system, edit `/etc/pam.d/sudo` (BACK IT UP
@@ -122,33 +137,52 @@ while testing.
 
 ## How does this protect against an attacker?
 
-**MVP-2 (this release):** the substrate-bound verify result
-actually traverses the auth flow. The PAM module reads the
-LL-040 IPC byte; the daemon's cached `verify_full` outcome
-gates `PAM_SUCCESS` / `PAM_AUTH_ERR`. An attacker who runs
-their own LavaLamp daemon under their own envelope on
-different hardware is caught: their daemon's verify returns
-REJECT against the registered envelope they don't have, the
-IPC byte is 'R', PAM denies. The substrate-bound proof
-defends here, not just the existence-bit.
+**v0.0.3 / LL-041 v2 (this release).** The substrate-bound
+verify result traverses the auth flow with cryptographic
+integrity. Three defenses layer on top of MVP-2:
 
-**MVP-1 fallback:** if the LL-040 socket is unavailable, the
-module falls back to the LL-039 heartbeat-age gate. Raises
-the bar on credential-replay attacks (attacker needs the
-daemon running on the substrate) but doesn't actually
-traverse the verify result — that's the gap MVP-2 closes.
+- **Capture-and-replay defended.** Client supplies a fresh
+  16-byte random nonce per request; daemon binds the nonce
+  into the response HMAC. Captured responses can't be
+  replayed in a different session — the nonce won't match.
+- **Same-process-tier MITM forgery defended.** Daemon
+  generates a 32-byte random secret on startup and writes
+  it to `verify.secret` (mode 0600). Both sides compute
+  HMAC-SHA256(secret, nonce ‖ result ‖ timestamp). An
+  unprivileged attacker (different UID) who somehow gains
+  socket access cannot read the secret file and so cannot
+  forge valid HMACs.
+- **Stale captures defended.** Daemon includes its current
+  Unix epoch second in the signed payload; client validates
+  freshness within `IPC_TS_SKEW_S = 30s`.
 
-**MVP-3 (next):** anti-replay via session-binding tokens.
-Without it, an attacker who can read the IPC byte once and
-replay the connection during a different session window gets
-the same byte response. Production deployments at higher
-threat tiers should wait for MVP-3 / TPM-bound signing keys.
+**MVP-2 fallback (v1 single-byte protocol):** superseded by
+v2 in v0.0.3. v1 daemons (LavaLamp v0.0.84) are NOT
+backward-compatible with v2 clients; a v0.0.3 PharOS PAM
+module talking to a v0.0.84 daemon will fail closed. Upgrade
+both sides together.
 
-**Out of scope:** kernel-level adversaries on the device
-(LavaLamp LL-015 permanent `:open`); user-layer attacks
-(phishing, SIM-swap); state-actor TEMPEST (LavaLamp LL-025
-tier-bounded). PharOS is one membrane in a defense-in-depth
-stack; it is not a panacea.
+**MVP-1 fallback (LL-039 heartbeat):** if the v2 socket OR
+secret file is missing, the module falls back to the
+heartbeat-age gate. Raises the bar on credential-replay
+attacks but doesn't traverse the verify result — that's why
+v2 is the preferred path.
+
+**Not yet defended (load-bearing limit):** same-UID
+attackers (root or daemon UID) can read both the socket and
+the secret file, and therefore can forge any HMAC. This is
+the limit shared-secret HMAC reaches. **TPM-bound asymmetric
+signing** (deferred to **v0.0.6**, LL-022 strategy 1
+integration) replaces the shared secret with a TPM-private
+signing key + filesystem-public verification key — same-UID
+attackers can read the public key but cannot extract the
+private key. That's the next milestone.
+
+**Out of scope (LavaLamp boundaries).** Kernel-level
+adversaries on the device (LL-015 permanent `:open`);
+user-layer attacks (phishing, SIM-swap); state-actor TEMPEST
+(LL-025 tier-bounded). PharOS is one membrane in a
+defense-in-depth stack; it is not a panacea.
 
 ## License
 
