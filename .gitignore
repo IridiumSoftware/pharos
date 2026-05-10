@@ -1,0 +1,27 @@
+# C build artefacts
+*.o
+*.so
+*.a
+*.lo
+*.la
+
+# macOS metadata
+.DS_Store
+
+# paper-index hook artifacts (local navigation aids; not project content)
+.paper-index.json
+**/.paper-index.json
+
+# Project-internal governance — kept local, not tracked publicly
+CLAUDE.md
+
+# Project-internal governance / process records — kept local, not tracked publicly
+PHAROS_SPEC.md
+artifact_registry.md
+changelog.md
+docs/
+dashboard.md
+
+# CI / build outputs
+build/
+target/

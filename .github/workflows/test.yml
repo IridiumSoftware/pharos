@@ -1,0 +1,43 @@
+# PharOS CI — builds and exercises the pam_lavalamp module on
+# ubuntu-latest. Linux is the v0.0.1 first-platform target;
+# macOS Authorization Plug-in and Windows Credential Provider
+# are queued for later milestones and will gain their own CI
+# matrix entries when those platforms ship.
+#
+# Build artefact: src/c/pam_lavalamp/pam_lavalamp.so
+# Test harness: test/test_pam_lavalamp.sh
+
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  pam-linux:
+    name: PAM module (Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libpam0g-dev build-essential
+
+      - name: Build pam_lavalamp.so
+        working-directory: src/c/pam_lavalamp
+        run: make
+
+      - name: Verify module is a valid PAM shared object
+        run: |
+          file src/c/pam_lavalamp/pam_lavalamp.so
+          file src/c/pam_lavalamp/pam_lavalamp.so | grep -q "shared object"
+
+      - name: Run heartbeat-age fixture tests
+        run: bash test/test_pam_lavalamp.sh

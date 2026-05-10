@@ -1,0 +1,35 @@
+================================================================
+LICENSE
+================================================================
+
+PharOS — OS-layer authentication membrane for substrate-bound
+identity (Triad Deployments portfolio).
+
+Released to humanity under the Triadic Closure License (TCL
+v1.3). The Triadic Closure License is self-referential: it
+licenses the work under exactly the structural conditions the
+work describes. The work may be freely read, cited, implemented,
+extended, critiqued, taught, and redistributed by any person,
+organization, or intelligence. No party may claim exclusive
+proprietary ownership, exclusive license, sole attribution, or
+unilateral monetization rights over the work or its derivatives.
+
+PROTOTYPE-STAGE METHODOLOGY. This repository is a working
+prototype of an OS-layer authentication membrane that exposes
+LavaLamp's verifier API (LL-023) to platform-native
+authentication infrastructure. It is sufficient to demonstrate
+the structural properties claimed; production deployment
+requires per-platform integration testing, conformance
+verification with downstream OS auth flows (PAM / Authorization
+Plug-in / Credential Provider), red-team testing against the
+resolution-bounded threat model, and pilot implementations
+with careful failure-mode analysis.
+
+For the canonical TCL v1.3 text, see the upstream Triad
+Deployments repositories or the Possibilistic Security
+canonical reference:
+
+  https://github.com/IridiumSoftware/possibilistic-security
+  https://github.com/IridiumSoftware/lavalamp
+
+Author: Aaron Green, 2026.
