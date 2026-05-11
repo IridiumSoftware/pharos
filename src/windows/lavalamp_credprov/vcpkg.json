@@ -1,0 +1,11 @@
+{
+    "name": "lavalamp-credential-provider",
+    "version-string": "0.0.8",
+    "description": "PharOS Windows Credential Provider Filter for the LavaLamp substrate-bound identity primitive.",
+    "dependencies": [
+        {
+            "name": "openssl",
+            "version>=": "3.0.0"
+        }
+    ]
+}
