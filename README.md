@@ -20,60 +20,70 @@ identity claims and impermeable to spoofed ones).
 
 ## Status
 
-**v0.0.5 — MVP-5 ECDSA P-256 protocol upgrade.** Same
-asymmetric-signing posture as v0.0.4, but on a curve
-compatible with both Apple Secure Enclave and TPM 2.0 —
-unblocks future SE/TPM2 hardware binding without further
-protocol changes. Wire format speaks **LL-043 v4**: 17-byte
-challenge (`0x04` + nonce), 74-byte response (version +
-result + 8-byte timestamp + 64-byte raw r‖s ECDSA P-256
-signature). Public key file is 33 bytes (SEC1-compressed).
+**v0.0.8 — Windows Credential Provider Filter scaffold.**
+Three-platform OS-membrane coverage now present in repo:
 
-**v0.0.4 — MVP-4 asymmetric signing.** A reference Linux PAM
-module that gates session authentication on the LavaLamp
-daemon's substrate-bound verify result, with **Ed25519
-asymmetric-signature** challenge-response. The architectural
-step over v0.0.3: client no longer holds a secret. Daemon
-holds private key; clients read public key only.
+- **Linux PAM module** (`src/c/pam_lavalamp/`) — `:tested`.
+  ubuntu-latest CI runs build + five MVP-5 v4 protocol
+  fixtures on every push (ACCEPT / REJECT / STALE /
+  ts-skew / no-socket-fallback).
+- **macOS Authorization Plug-in**
+  (`src/macos/LavaLampMechanism.bundle`) — `:argued`.
+  ObjC bundle, ad-hoc-signed, 54 KB Mach-O arm64. macos-
+  latest CI builds + verifies signature on every push;
+  authd-mediated runtime testing requires user-supervised
+  install on a test machine (lockout risk).
+- **Windows Credential Provider Filter**
+  (`src/windows/lavalamp_credprov/`) — `:argued`. ~600 LOC
+  C++ COM scaffold, structurally complete. NOT compile-
+  tested on Windows (PharOS dev on macOS; no Windows host);
+  promotion to `:tested` requires VS 2022 build + Win11 VM
+  install + admit/deny validation.
 
-The PAM module speaks the **LL-042 v3 protocol**:
+All three shims speak the **LL-043 v4 ECDSA P-256
+protocol** against the LavaLamp daemon at
+`~/.lavalamp/verify.sock` (or `/var/run/lavalamp/`
+system-mode):
 
-1. Reads the 32-byte daemon **public key** from
-   `/var/run/lavalamp/verify.pub` (mode 0644 — world-
-   readable; verification capability does not require
-   secret-holding).
+1. Reads the 33-byte SEC1-compressed **public key** from
+   `verify.pub` (mode 0644).
 2. Generates a 16-byte random nonce per request.
-3. Sends a 17-byte challenge (`0x03 + nonce`).
+3. Sends a 17-byte challenge (`0x04 + nonce`).
 4. Receives a 74-byte response (version + result + 8-byte
-   daemon timestamp + **64-byte Ed25519 signature** over
-   `nonce ‖ result ‖ timestamp`).
-5. Validates: signature against the public key via
-   OpenSSL `EVP_DigestVerify`; timestamp within ±30 s of
-   current time; version correct.
+   daemon timestamp + 64-byte raw r‖s ECDSA P-256 signature).
+5. Validates: signature via OpenSSL `EVP_DigestVerify` with
+   SHA-256; timestamp within ±30 s; version correct.
 6. Gates on result byte if all validations pass.
 
-Result-byte semantics (LL-040/041/042):
-- `'A'` (ACCEPT, fresh) + valid Ed25519 signature →
-  `PAM_SUCCESS`
-- `'R'` (REJECT) + valid signature → `PAM_AUTH_ERR`
-- `'S'` (STALE) + valid signature → `PAM_AUTH_ERR`
-- signature invalid / stale timestamp / wrong version →
-  `PAM_AUTH_ERR` (no fallback; possible tamper signal)
-- socket *or* public-key file missing → fall back to
-  **MVP-1** heartbeat liveness gate via LL-039
+Result-byte semantics:
+- `'A'` (ACCEPT, fresh) + valid signature → admit (PAM_SUCCESS,
+  kAuthorizationResultAllow, all-tiles-shown).
+- `'R'` (REJECT) + valid signature → deny.
+- `'S'` (STALE) + valid signature → deny.
+- signature invalid / stale timestamp / wrong version → deny
+  (no fallback; possible tamper signal).
+- socket or public-key file missing → deny (fail closed for
+  the cryptographic path; Linux PAM has a separate liveness
+  fallback to MVP-1 LL-039 heartbeat).
 
-**Honest framing.** v0.0.4 defends four classes of attack:
-capture-and-replay (nonce binding), same-process-tier MITM
-forgery (signature can't be forged without private key),
-stale captured responses (timestamp freshness), and
-**public-key compromise → no forgery** (the asymmetric
-shape lets anyone verify, but only the daemon can sign).
-It does NOT defend against same-UID attackers (root or
-daemon UID can read `verify.priv` directly on disk → can
-forge any signature). TPM/Secure-Enclave key binding
-(deferred to **v0.0.7**, matching LavaLamp LL-043 / LL-044)
-closes that gap by moving the private key off-disk into a
-hardware-bound enclave.
+**Whitepaper v1.0** ships in this repo as
+`pharos_whitepaper.txt` + `pharos_whitepaper.pdf`. 8 sections
++ 2 appendices, mirroring the LavaLamp whitepaper structure,
+scoped to the OS-membrane shim role.
+
+**Honest framing.** PharOS does NOT add a new security
+primitive. The load-bearing claim is LavaLamp's resolution-
+bounded security (LL-008), transmitted through the membrane
+verbatim. PharOS preserves LL-002 visual-security decoupling,
+LL-017 no-oracle, and LL-008 scope. PharOS defends
+capture-and-replay (nonce), MITM forgery (asymmetric
+signing), stale captures (freshness), and public-key
+compromise (asymmetric shape). It does NOT defend same-UID
+attackers — that's LL-044 Linux TPM 2.0 binding (active on
+Linux hosts with `tpm2-tools`), forthcoming LL-045 macOS SE
+binding (gated by Apple Developer ID provisioning), and a
+forthcoming PH-NNN Windows TPM 2.0 binding via Windows CNG
++ Microsoft Platform Crypto Provider.
 
 ## Position in the Triad Deployments
 
@@ -89,36 +99,67 @@ tier. The threat-landscape companion in the LavaLamp repo
 canonical reference for the castle/membrane/immune-system
 framing PharOS instantiates.
 
-## What v0.0.2 ships
+## What v0.0.8 ships
 
-- **`src/c/pam_lavalamp/`** — Linux PAM module. Single C file
-  + Makefile. Builds with `make` (requires `libpam0g-dev` on
-  Debian/Ubuntu). Installs to `/lib/x86_64-linux-gnu/security/`.
-  Implements MVP-2 IPC client (`try_ipc_query`) with MVP-1
-  heartbeat fallback.
-- **`test/mock_lavalamp_daemon.py`** — Python AF_UNIX mock
-  daemon for protocol fixture testing without requiring a
-  running Julia daemon.
-- **`test/test_pam_lavalamp.sh`** — integration test harness.
-  §1 MVP-1 heartbeat-age fixtures + §2 MVP-2 IPC protocol
-  fixtures + §3 module sanity.
-- **CI** on `ubuntu-latest`. Builds the module, runs the test
-  harness on every push to master.
+- **`src/c/pam_lavalamp/`** — Linux PAM module
+  (`pam_lavalamp.so`). C source + Makefile. Builds with
+  `make` (requires `libpam0g-dev` + `libssl-dev` on
+  Debian/Ubuntu). Implements LL-043 v4 ECDSA P-256 client
+  with MVP-1 heartbeat fallback. 10 spec entries' worth of
+  evolution from MVP-1 (v0.0.1, heartbeat liveness) to
+  MVP-5 (v0.0.5, v4 ECDSA).
+- **`src/macos/LavaLampMechanism.bundle/`** — macOS
+  Authorization Plug-in. ObjC source + `Info.plist` +
+  Makefile + careful-deployment README. ~54 KB Mach-O
+  arm64, ad-hoc-signed. Loaded by `authd` when a configured
+  authorization right's mechanism array references the
+  bundle.
+- **`src/windows/lavalamp_credprov/`** — Windows Credential
+  Provider Filter scaffold. ~600 LOC C++ COM scaffold:
+  `dllmain.cpp` (DllMain + class factory + COM exports),
+  `LavaLampCredentialProviderFilter.cpp/.h` (filter impl),
+  `LavaLampIPC.cpp/.h` (v4 client with AF_UNIX or named-pipe
+  transport selectable at compile time), CMakeLists.txt +
+  vcpkg.json + register-instructions README. Compile-tested
+  in shape only; Windows-host build deferred.
+- **`test/`** — Python AF_UNIX mock daemon
+  (`mock_lavalamp_daemon.py`) + integration test harness
+  (`test_pam_lavalamp.sh`) with §1 MVP-1 heartbeat fixtures
+  + §2 MVP-5 v4 protocol fixtures.
+- **CI** on `ubuntu-latest` (PAM build + test) and
+  `macos-latest` (bundle build + sign-verify) on every push.
+- **`pharos_whitepaper.txt`** + **`pharos_whitepaper.pdf`** —
+  whitepaper v1.0. 8 sections + 2 appendices.
 
-## What v0.0.2 does NOT ship
+## What v0.0.8 does NOT ship
 
-- **Anti-replay (session-binding tokens).** Status: queued for
-  MVP-3 (v0.0.5). Requires TPM-bound signing keys (LL-022
-  strategy 1). An attacker who can read the LL-040 socket
-  once and replay the connection currently gets the same
-  byte response.
-- **macOS Authorization Plugin.** Status: queued for v0.0.3.
-  Requires Cocoa + private-API integration; harder build and
-  code-signing pipeline.
-- **Windows Credential Provider.** Status: queued for v0.0.4.
-  WMI + COM surface; deferred to last.
-- **Registration ceremony / revocation flow.** Status: queued
-  for MVP-3 (v0.0.5). Bundled with TPM-bound envelope store.
+- **Windows-host build artefact.** The Credential Provider
+  Filter is scaffold-stage: compiles in shape, COM contracts
+  wired, OpenSSL ECDSA path mirroring Linux/macOS shims;
+  but not built against a Windows compiler. PharOS dev is
+  on macOS; no Windows host available. Promotion to
+  `:tested` requires Visual Studio 2022 + Win11 VM
+  validation.
+- **Daemon-side Windows IPC.** The LavaLamp daemon uses
+  AF_UNIX at `~/.lavalamp/verify.sock`. Julia's
+  `Sockets.UnixDomainSocket` should work on Windows 10
+  build 17063+ but is unproven for this codebase. The
+  Windows credprov scaffold compiles with either AF_UNIX
+  or named-pipe transport so a future daemon-side commit
+  can choose either.
+- **Hardware-bound key storage on the PharOS side.**
+  Currently the daemon's ECDSA P-256 private key lives in
+  process memory (LL-043 software-key tier) or in a TPM 2.0
+  persistent handle on Linux (LL-044 active when
+  `tpm2-tools` is installed). macOS Secure Enclave binding
+  (forthcoming LL-045) is gated by Apple Developer ID
+  provisioning. Windows TPM 2.0 binding via Windows CNG +
+  Microsoft Platform Crypto Provider is a forthcoming
+  PH-NNN.
+- **Registration ceremony / revocation flow.** Status:
+  queued for v0.0.10. Currently relies on LavaLamp's
+  registration (LL-010 / LL-011 / LL-012 in the LavaLamp
+  spec).
 
 ## Build + try
 
