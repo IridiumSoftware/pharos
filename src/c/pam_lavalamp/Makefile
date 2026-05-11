@@ -15,7 +15,15 @@
 # libcrypto (-lcrypto, OpenSSL or LibreSSL).
 
 CC      ?= gcc
-CFLAGS  ?= -O2 -Wall -Wextra -Werror -fPIC -fstack-protector-strong
+# -Wno-deprecated-declarations silences OpenSSL 3.x notices on
+# the EC_KEY_*/EVP_PKEY_assign APIs we use for SEC1-compressed
+# point decoding. The APIs are deprecated-but-functional in
+# OpenSSL 3.0+; migration to the modern EVP_PKEY-only path is
+# queued for a future commit. Without this flag the build fails
+# on Ubuntu 24.04 (libssl-dev 3.x) since -Werror promotes the
+# notice to an error.
+CFLAGS  ?= -O2 -Wall -Wextra -Werror -fPIC -fstack-protector-strong \
+           -Wno-deprecated-declarations
 LDFLAGS ?= -shared
 LIBS    := -lpam -lcrypto
 
