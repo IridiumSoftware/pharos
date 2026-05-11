@@ -47,6 +47,65 @@ Requirements:
   `SecKeyVerifySignature` to lift the Homebrew dylib dependency
   that authd cannot resolve at dlopen time.)
 
+## Deployment posture: Apple Developer ID required (v0.0.9 finding)
+
+Live-testing on macOS 26.4.1 (Sequoia, build 25E253) on
+2026-05-11 established empirically that **modern macOS authd
+rejects ad-hoc-signed Authorization Plug-ins** even though
+`authorizationhost` carries the `com.apple.private.security.
+clear-library-validation` entitlement.
+
+Symptoms (reproducible):
+
+- `security authorize <right>` returns `NO (-60005)`
+  (`errAuthorizationInternal`).
+- `authd` log shows
+  `running mechanism LavaLampMechanism:invoke,privileged
+  (1 of 1)` looping every few hundred microseconds, then
+  `copy_rights: authorization failed`.
+- No `syslog` output from inside the mechanism (admit /
+  deny / verify-failed / pubkey-not-found) — meaning
+  `MechanismInvoke` is never reached.
+- AMFI logs the bundle as `adhoc signed` (informational).
+- `spctl -a -vvv -t install` against the installed bundle
+  returns `rejected`.
+
+The bundle's symbols are correctly exported
+(`nm -gU | grep AuthorizationPluginCreate`); the dylib
+dependencies are system-only (`otool -L` — Security,
+CoreFoundation, Foundation, libobjc, libSystem); the
+code-signature itself is valid. What fails is the
+Gatekeeper / notarization check that runs inside the
+plugin-loading pipeline downstream of AMFI.
+
+**Promotion path to production deployment:**
+
+1. Enroll in the Apple Developer Program ($99/yr).
+2. Obtain a "Developer ID Application" code-signing
+   certificate.
+3. Replace `codesign --force --sign -` in the Makefile
+   with `codesign --force --sign "Developer ID Application:
+   Your Name (TEAMID)" --options runtime --timestamp`
+   (Hardened Runtime + secure timestamp required for
+   notarization).
+4. Notarize the bundle via `xcrun notarytool submit
+   LavaLampMechanism.bundle.zip --apple-id ... --wait`.
+5. Staple the notarization ticket: `xcrun stapler staple
+   LavaLampMechanism.bundle`.
+6. Install + wire + admit/deny test — should succeed.
+
+Until then, the bundle ships as **code-ready and
+structurally complete** but cannot reach `MechanismInvoke`
+on modern macOS. The implementation correctness can be
+inspected via source review; admit/deny correctness
+against the running LavaLamp daemon remains
+**unobserved** in this state.
+
+This is the same Apple-trust gate that blocks LavaLamp
+LL-045 macOS Secure Enclave binding
+(`kSecAttrTokenIDSecureEnclave` requires Developer ID
+provisioning). Resolving either lifts the other.
+
 ## Deployment (careful — read every step before running anything)
 
 ### Pre-flight checks
