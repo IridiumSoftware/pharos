@@ -1,11 +1,13 @@
-# PharOS CI — builds and exercises the pam_lavalamp module on
-# ubuntu-latest. Linux is the v0.0.1 first-platform target;
-# macOS Authorization Plug-in and Windows Credential Provider
-# are queued for later milestones and will gain their own CI
-# matrix entries when those platforms ship.
+# PharOS CI — builds and exercises:
+#   - pam-linux: ubuntu-latest, builds pam_lavalamp.so + runs the
+#     heartbeat-age and v4-protocol fixture suite (PH-002, PH-009).
+#   - macos-bundle: macos-latest, builds LavaLampMechanism.bundle
+#     and confirms it ad-hoc-signs cleanly (PH-011 build-smoke).
+#     authd-mediated runtime testing remains user-supervised
+#     (lockout risk); CI catches build-breakage only.
 #
-# Build artefact: src/c/pam_lavalamp/pam_lavalamp.so
-# Test harness: test/test_pam_lavalamp.sh
+# Windows Credential Provider (forthcoming PH-NNN) will add its
+# own CI job when that platform ships.
 
 name: CI
 
@@ -41,3 +43,33 @@ jobs:
 
       - name: Run heartbeat-age fixture tests
         run: bash test/test_pam_lavalamp.sh
+
+  macos-bundle:
+    name: Authorization Plug-in (macOS)
+    runs-on: macos-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install OpenSSL 3 via Homebrew
+        run: |
+          brew install openssl@3
+          brew --prefix openssl@3
+
+      - name: Build LavaLampMechanism.bundle
+        working-directory: src/macos
+        run: make
+
+      - name: Verify bundle structure
+        working-directory: src/macos
+        run: |
+          test -f LavaLampMechanism.bundle/Contents/Info.plist
+          test -x LavaLampMechanism.bundle/Contents/MacOS/LavaLampMechanism
+          file LavaLampMechanism.bundle/Contents/MacOS/LavaLampMechanism
+          file LavaLampMechanism.bundle/Contents/MacOS/LavaLampMechanism | grep -q "Mach-O"
+
+      - name: Verify ad-hoc code-signature
+        working-directory: src/macos
+        run: |
+          codesign --verify --verbose=2 LavaLampMechanism.bundle
+          codesign -dvv LavaLampMechanism.bundle 2>&1 | grep -q "Signature=adhoc"
