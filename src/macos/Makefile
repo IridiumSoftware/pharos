@@ -15,20 +15,19 @@ SRC         = LavaLampMechanism.m
 BINARY      = $(BUNDLE)/Contents/MacOS/LavaLampMechanism
 
 CC          = clang
-# arm64-only on Apple Silicon hosts (Homebrew OpenSSL is arm64
-# on this machine). Rebuild on x86_64 hosts produces an
-# x86_64 binary; cross-archs require x86_64 OpenSSL too.
-CFLAGS      = -arch arm64 \
-              -fobjc-arc -Wall -Wextra -O2 \
-              -I/opt/homebrew/include \
-              -I/opt/homebrew/opt/openssl@3/include
+# Universal binary — arm64 + x86_64. Both arches link only
+# against macOS system frameworks (Security, CoreFoundation,
+# Foundation) — no Homebrew or other non-system dylib
+# dependencies, so the bundle runs under root-privileged
+# authd's restricted dyld search path. The OpenSSL dependency
+# from the v0.0.6 build was removed in v0.0.9 (verify path
+# rewritten on Security.framework SecKeyVerifySignature).
+CFLAGS      = -arch arm64 -arch x86_64 \
+              -fobjc-arc -Wall -Wextra -O2
 LDFLAGS     = -bundle \
               -framework Security \
               -framework CoreFoundation \
-              -framework Foundation \
-              -L/opt/homebrew/lib \
-              -L/opt/homebrew/opt/openssl@3/lib \
-              -lcrypto
+              -framework Foundation
 
 INSTALL_DIR = /Library/Security/SecurityAgentPlugins
 

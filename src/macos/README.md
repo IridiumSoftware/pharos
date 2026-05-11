@@ -41,7 +41,11 @@ at `Contents/MacOS/LavaLampMechanism`. Bundle is universal
 
 Requirements:
 - Xcode command-line tools (`xcode-select --install`)
-- Homebrew OpenSSL 3 (`brew install openssl@3`)
+- No third-party dependencies — bundle uses only macOS system
+  frameworks (Security, CoreFoundation, Foundation) as of v0.0.9.
+  (v0.0.6 required Homebrew OpenSSL 3; replaced with
+  `SecKeyVerifySignature` to lift the Homebrew dylib dependency
+  that authd cannot resolve at dlopen time.)
 
 ## Deployment (careful — read every step before running anything)
 

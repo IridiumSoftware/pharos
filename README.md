@@ -29,7 +29,10 @@ Three-platform OS-membrane coverage now present in repo:
   ts-skew / no-socket-fallback).
 - **macOS Authorization Plug-in**
   (`src/macos/LavaLampMechanism.bundle`) — `:argued`.
-  ObjC bundle, ad-hoc-signed, 54 KB Mach-O arm64. macos-
+  ObjC bundle, ad-hoc-signed, ~119 KB Mach-O universal
+  (arm64 + x86_64), zero non-system dylib dependencies as
+  of v0.0.9 (verify path on Security.framework
+  SecKeyVerifySignature, lifted off OpenSSL). macos-
   latest CI builds + verifies signature on every push;
   authd-mediated runtime testing requires user-supervised
   install on a test machine (lockout risk).
@@ -110,7 +113,7 @@ framing PharOS instantiates.
   MVP-5 (v0.0.5, v4 ECDSA).
 - **`src/macos/LavaLampMechanism.bundle/`** — macOS
   Authorization Plug-in. ObjC source + `Info.plist` +
-  Makefile + careful-deployment README. ~54 KB Mach-O
+  Makefile + careful-deployment README. ~119 KB Mach-O
   arm64, ad-hoc-signed. Loaded by `authd` when a configured
   authorization right's mechanism array references the
   bundle.

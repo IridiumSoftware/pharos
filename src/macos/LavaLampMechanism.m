@@ -63,11 +63,17 @@
 #include <CoreFoundation/CoreFoundation.h>
 #include <Foundation/Foundation.h>
 
-#include <openssl/bn.h>
-#include <openssl/ec.h>
-#include <openssl/ecdsa.h>
-#include <openssl/evp.h>
-#include <openssl/obj_mac.h>
+/* v0.0.9 (2026-05-11): verify path rewritten from OpenSSL to
+ * Apple's Security.framework. Bundle now depends only on system
+ * libraries shipped with every macOS — no Homebrew dylib path
+ * dependency. The previous OpenSSL-based build linked
+ * /opt/homebrew/opt/openssl@3/lib/libcrypto.3.dylib which authd
+ * (running as root) could not resolve at dlopen time, causing
+ * the mechanism to fail before reaching its body. SecKey* is
+ * the conventional macOS API for ECDSA P-256 over SHA-256 with
+ * X9.62-DER-encoded signatures. */
+#include <Security/SecKey.h>
+#include <CoreFoundation/CoreFoundation.h>
 
 #include <fcntl.h>
 #include <pwd.h>
@@ -144,54 +150,121 @@ static int read_pubkey_file(const char *path, unsigned char out[IPC_PUB_LEN]) {
     return (n == IPC_PUB_LEN) ? 0 : -1;
 }
 
-static EVP_PKEY *pubkey_compressed_to_evp(const unsigned char *pub33) {
-    EC_GROUP *group = EC_GROUP_new_by_curve_name(NID_X9_62_prime256v1);
-    if (!group) return NULL;
-    EC_POINT *point = EC_POINT_new(group);
-    if (!point) { EC_GROUP_free(group); return NULL; }
-    EC_KEY *eckey = NULL;
-    EVP_PKEY *pkey = NULL;
-    BN_CTX *ctx = BN_CTX_new();
-    if (!ctx) goto cleanup;
-    if (EC_POINT_oct2point(group, point, pub33, IPC_PUB_LEN, ctx) != 1) goto cleanup;
-    eckey = EC_KEY_new();
-    if (!eckey) goto cleanup;
-    if (EC_KEY_set_group(eckey, group) != 1) goto cleanup;
-    if (EC_KEY_set_public_key(eckey, point) != 1) goto cleanup;
-    pkey = EVP_PKEY_new();
-    if (!pkey) goto cleanup;
-    if (EVP_PKEY_assign_EC_KEY(pkey, eckey) != 1) {
-        EVP_PKEY_free(pkey); pkey = NULL; goto cleanup;
+/*
+ * pubkey_compressed_to_seckey — build a SecKeyRef from the
+ * 33-byte SEC1-compressed P-256 public key. Returns NULL on
+ * failure; caller releases with CFRelease.
+ *
+ * SecKeyCreateWithData accepts X9.63-encoded EC public keys,
+ * which by the spec includes both uncompressed (65 bytes, 0x04
+ * || X || Y) and compressed (33 bytes, 0x02/0x03 || X) forms.
+ */
+static SecKeyRef pubkey_compressed_to_seckey(
+        const unsigned char pub33[IPC_PUB_LEN]) {
+    CFDataRef key_data = CFDataCreate(NULL, pub33, IPC_PUB_LEN);
+    if (!key_data) return NULL;
+
+    int bits = 256;
+    CFNumberRef bits_ref = CFNumberCreate(NULL, kCFNumberIntType, &bits);
+    if (!bits_ref) { CFRelease(key_data); return NULL; }
+
+    const void *keys[]   = { kSecAttrKeyType,
+                              kSecAttrKeyClass,
+                              kSecAttrKeySizeInBits };
+    const void *values[] = { kSecAttrKeyTypeECSECPrimeRandom,
+                              kSecAttrKeyClassPublic,
+                              bits_ref };
+    CFDictionaryRef attrs = CFDictionaryCreate(
+        NULL, keys, values, 3,
+        &kCFTypeDictionaryKeyCallBacks,
+        &kCFTypeDictionaryValueCallBacks);
+
+    CFErrorRef err = NULL;
+    SecKeyRef pkey = NULL;
+    if (attrs) {
+        pkey = SecKeyCreateWithData(key_data, attrs, &err);
+        CFRelease(attrs);
     }
-    eckey = NULL;
-cleanup:
-    if (eckey) EC_KEY_free(eckey);
-    if (point) EC_POINT_free(point);
-    if (group) EC_GROUP_free(group);
-    if (ctx) BN_CTX_free(ctx);
+    CFRelease(bits_ref);
+    CFRelease(key_data);
+
+    if (!pkey && err) {
+        /* Diagnostic for syslog audit trail when pubkey parsing
+         * fails — common cause is the daemon writing a malformed
+         * pubkey file or a SEC1 prefix Apple rejects. */
+        CFStringRef desc = CFErrorCopyDescription(err);
+        if (desc) {
+            char buf[256];
+            if (CFStringGetCString(desc, buf, sizeof(buf),
+                                    kCFStringEncodingUTF8)) {
+                syslog(LOG_NOTICE,
+                       "LavaLampMechanism: SecKeyCreateWithData failed: %s",
+                       buf);
+            }
+            CFRelease(desc);
+        }
+        CFRelease(err);
+    }
     return pkey;
 }
 
-static unsigned char *raw_to_der_ecdsa(const unsigned char *raw64, int *out_len) {
-    BIGNUM *r = BN_bin2bn(raw64, IPC_RAW_FIELD_LEN, NULL);
-    BIGNUM *s = BN_bin2bn(raw64 + IPC_RAW_FIELD_LEN, IPC_RAW_FIELD_LEN, NULL);
-    if (!r || !s) {
-        if (r) BN_free(r);
-        if (s) BN_free(s);
-        return NULL;
+/*
+ * raw_signature_to_der — encode a 64-byte raw r||s ECDSA P-256
+ * signature as an X9.62 DER SEQUENCE { INTEGER r, INTEGER s }.
+ * Returns a CFDataRef the caller releases with CFRelease;
+ * NULL on encoding failure.
+ *
+ * Worst case length: 0x30 0x46 0x02 0x21 <33 bytes for r> 0x02
+ * 0x21 <33 bytes for s> = 72 bytes. We allocate 80 to be safe.
+ * Each INTEGER may need a leading 0x00 if the high bit is set
+ * (to disambiguate from a negative-signed encoding per DER).
+ */
+static CFDataRef raw_signature_to_der(
+        const unsigned char raw64[IPC_SIG_LEN]) {
+    unsigned char der[80];
+    size_t pos = 0;
+
+    der[pos++] = 0x30;           /* SEQUENCE tag */
+    size_t seq_len_pos = pos++;  /* placeholder for length */
+
+    /* INTEGER r */
+    der[pos++] = 0x02;
+    size_t r_len_pos = pos++;
+    size_t r_payload_start = pos;
+    const unsigned char *r_src = raw64;
+    size_t r_skip = 0;
+    /* Strip leading zero bytes from r; keep at least one. */
+    while (r_skip < IPC_RAW_FIELD_LEN - 1 && r_src[r_skip] == 0x00) {
+        r_skip++;
     }
-    ECDSA_SIG *sig = ECDSA_SIG_new();
-    if (!sig) { BN_free(r); BN_free(s); return NULL; }
-    if (ECDSA_SIG_set0(sig, r, s) != 1) {
-        BN_free(r); BN_free(s); ECDSA_SIG_free(sig);
-        return NULL;
+    /* If the most-significant byte has its high bit set, prepend
+     * 0x00 so the INTEGER reads as positive. */
+    if (r_src[r_skip] & 0x80) {
+        der[pos++] = 0x00;
     }
-    unsigned char *der = NULL;
-    int der_len = i2d_ECDSA_SIG(sig, &der);
-    ECDSA_SIG_free(sig);
-    if (der_len < 0 || !der) return NULL;
-    *out_len = der_len;
-    return der;
+    memcpy(der + pos, r_src + r_skip, IPC_RAW_FIELD_LEN - r_skip);
+    pos += IPC_RAW_FIELD_LEN - r_skip;
+    der[r_len_pos] = (unsigned char)(pos - r_payload_start);
+
+    /* INTEGER s */
+    der[pos++] = 0x02;
+    size_t s_len_pos = pos++;
+    size_t s_payload_start = pos;
+    const unsigned char *s_src = raw64 + IPC_RAW_FIELD_LEN;
+    size_t s_skip = 0;
+    while (s_skip < IPC_RAW_FIELD_LEN - 1 && s_src[s_skip] == 0x00) {
+        s_skip++;
+    }
+    if (s_src[s_skip] & 0x80) {
+        der[pos++] = 0x00;
+    }
+    memcpy(der + pos, s_src + s_skip, IPC_RAW_FIELD_LEN - s_skip);
+    pos += IPC_RAW_FIELD_LEN - s_skip;
+    der[s_len_pos] = (unsigned char)(pos - s_payload_start);
+
+    der[seq_len_pos] = (unsigned char)(pos - (seq_len_pos + 1));
+
+    return CFDataCreate(NULL, der, (CFIndex)pos);
 }
 
 /*
@@ -200,7 +273,7 @@ static unsigned char *raw_to_der_ecdsa(const unsigned char *raw64, int *out_len)
  * responds 'A' with a valid Ed25519 signature; 0 otherwise.
  *
  * Resolution: tries SYSTEM_VERIFY_* paths first (root-installed
- * daemon); falls back to ~$auth_user/.lavalamp/* for user-mode.
+ * daemon); falls back to ~$auth_user/.lavalamp/ for user-mode.
  */
 static int verify_lavalamp_substrate(const char *auth_username) {
     char sock_path[MAX_PATH] = SYSTEM_VERIFY_SOCK;
@@ -278,33 +351,50 @@ static int verify_lavalamp_substrate(const char *auth_username) {
     if (skew < 0) skew = -skew;
     if (skew > IPC_TS_SKEW_S) return 0;
 
-    /* Build signed message + verify Ed25519 signature. */
+    /* Build signed message + verify ECDSA P-256 signature via
+     * Security.framework. The signed payload is nonce ‖ result ‖
+     * 8-byte little-endian timestamp — same shape the Linux PAM
+     * + Windows credprov verify against. */
     unsigned char signed_msg[IPC_NONCE_LEN + 1 + 8];
     memcpy(signed_msg, nonce, IPC_NONCE_LEN);
     signed_msg[IPC_NONCE_LEN] = result_byte;
     memcpy(signed_msg + IPC_NONCE_LEN + 1, response + 2, 8);
 
-    EVP_PKEY *pkey = pubkey_compressed_to_evp(pubkey_raw);
+    SecKeyRef pkey = pubkey_compressed_to_seckey(pubkey_raw);
     if (!pkey) return 0;
 
-    int der_len = 0;
-    unsigned char *der_sig = raw_to_der_ecdsa(response + 10, &der_len);
-    if (!der_sig) { EVP_PKEY_free(pkey); return 0; }
+    CFDataRef sig_der = raw_signature_to_der(response + 10);
+    if (!sig_der) { CFRelease(pkey); return 0; }
 
-    EVP_MD_CTX *mctx = EVP_MD_CTX_new();
-    int verify_rc = -1;
-    if (mctx) {
-        if (EVP_DigestVerifyInit(mctx, NULL, EVP_sha256(), NULL, pkey) == 1) {
-            verify_rc = EVP_DigestVerify(mctx,
-                                          der_sig, (size_t)der_len,
-                                          signed_msg, sizeof(signed_msg));
+    CFDataRef msg = CFDataCreate(NULL, signed_msg, (CFIndex)sizeof(signed_msg));
+    if (!msg) { CFRelease(sig_der); CFRelease(pkey); return 0; }
+
+    CFErrorRef verr = NULL;
+    Boolean verified = SecKeyVerifySignature(
+        pkey,
+        kSecKeyAlgorithmECDSASignatureMessageX962SHA256,
+        msg, sig_der, &verr);
+
+    if (!verified && verr) {
+        CFStringRef desc = CFErrorCopyDescription(verr);
+        if (desc) {
+            char buf[256];
+            if (CFStringGetCString(desc, buf, sizeof(buf),
+                                    kCFStringEncodingUTF8)) {
+                syslog(LOG_NOTICE,
+                       "LavaLampMechanism: SecKeyVerifySignature: %s",
+                       buf);
+            }
+            CFRelease(desc);
         }
-        EVP_MD_CTX_free(mctx);
+        CFRelease(verr);
     }
-    OPENSSL_free(der_sig);
-    EVP_PKEY_free(pkey);
 
-    if (verify_rc != 1) {
+    CFRelease(msg);
+    CFRelease(sig_der);
+    CFRelease(pkey);
+
+    if (!verified) {
         syslog(LOG_NOTICE,
                "LavaLampMechanism: signature verify failed");
         return 0;
