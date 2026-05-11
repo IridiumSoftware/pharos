@@ -1,7 +1,7 @@
 PHAROS:
 THE OS-LAYER AUTHENTICATION MEMBRANE FOR SUBSTRATE-BOUND IDENTITY
 Aaron Green
-May 2026 (v1.0)
+May 2026 (v1.1)
 
 ========================================================================
 LICENSE AND DEDICATION
@@ -59,27 +59,41 @@ and compute resolution is exceeded by the device's chaos-production
 rate — passes through PharOS transparently; PharOS preserves
 LL-002 visual-security decoupling (membrane returns only
 PAM_SUCCESS / PAM_AUTH_ERR on Linux, kAuthorizationResultAllow /
-kAuthorizationResultDeny on macOS — no spectrum), LL-017 no-oracle
-(rate-limited binary response with no latency-channel leak), and
-LL-008 resolution-bounded scope (PharOS does not promise defense
-beyond LavaLamp's stated A-class capability tiers).
+kAuthorizationResultDeny on macOS, all-tiles-shown / all-tiles-
+hidden on Windows — no spectrum), LL-017 no-oracle (rate-limited
+binary response with no latency-channel leak), and LL-008
+resolution-bounded scope (PharOS does not promise defense beyond
+LavaLamp's stated A-class capability tiers).
 
-The paper documents ten formal spec entries (PHAROS_SPEC.md), the
-LL-043 v4 ECDSA P-256 wire protocol that both shims speak, and
-the cross-Triad position of PharOS as the **membrane** between
-LavaLamp's substrate (the inner residence) and Lazarus' runtime-
-integrity layer (the inner sanctum). Status counts: 5 `:tested`
-(PAM-linux-MVP-1 plus the four-version protocol-upgrade chain
-PH-006/007/008/009 all consuming the matching LavaLamp LL-NNN
-contracts), 5 `:argued` (system-integration-target, heartbeat-
-channel-reuse, LL-017-membrane-preservation, defense-in-depth-
-with-LavaLamp, and the macOS Authorization Plug-in shim PH-011 —
-compile-tested + ad-hoc-signed with live-system validation
-deferred), 0 `:proved` (no Lean track yet — deferred until the
+The paper documents eleven formal spec entries (PHAROS_SPEC.md),
+the LL-043 v4 ECDSA P-256 wire protocol that all three shims
+speak, and the cross-Triad position of PharOS as the **membrane**
+between LavaLamp's substrate (the inner residence) and Lazarus'
+runtime-integrity layer (the inner sanctum). Status counts: 5
+`:tested` (PAM-linux-MVP-1 plus the four-version protocol-upgrade
+chain PH-006/007/008/009 all consuming the matching LavaLamp
+LL-NNN contracts), 6 `:argued` (system-integration-target,
+heartbeat-channel-reuse, LL-017-membrane-preservation, defense-
+in-depth-with-LavaLamp, the macOS Authorization Plug-in shim
+PH-011, and the Windows Credential Provider Filter scaffold
+PH-013), 0 `:proved` (no Lean track yet — deferred until the
 TPM/SE-bound key-storage layer is operational).
 
+Two live-test passes between v0.0.6 and v0.0.10 surfaced and
+bounded the macOS deployment posture for PH-011 empirically:
+v0.0.9 lifted a Homebrew/OpenSSL dylib dependency that authd
+could not resolve (rewrote the verify path on Apple's
+Security.framework `SecKeyVerifySignature`); v0.0.10 confirmed
+via `spctl -a -vvv -t install` that the bundle is `rejected` by
+modern macOS Gatekeeper, even though AMFI loads it cleanly. PH-011
+promotion to `:tested` is scoped concretely to Apple Developer
+ID Application code-signing + Apple Notarization — the same
+Apple-trust gate that blocks LavaLamp LL-045 macOS Secure
+Enclave binding. Linux PAM (PH-009) and Windows Credential
+Provider Filter (PH-013) are unaffected by this gate.
+
 PharOS positions itself as the third deployment in the Triad,
-shipping at v0.0.6 in May 2026, demonstrating that the LL-023
+shipping at v0.0.10 in May 2026, demonstrating that the LL-023
 consumer-API surface composes cleanly with platform-native
 authentication infrastructure. The substrate-physics primitive
 that does the actual identity-binding work lives in LavaLamp;
@@ -668,26 +682,85 @@ interact with.
 7.2  macOS Authorization Plug-in
 ------------------------------------------------------------------------
 
-53. The macOS Authorization Plug-in is `:argued` at v0.0.6.
-    Compile-tested + ad-hoc-signed; live-system validation
-    deferred to a user-supervised install session per the
-    deployment README. Promotion to `:tested` requires a
-    session where the user installs the bundle to
-    `/Library/Security/SecurityAgentPlugins/`, wires the
-    mechanism to a low-stakes rule
-    (e.g., `system.preferences.printing`), and confirms
-    admit/deny behavior on daemon-up / daemon-down states.
+53. The macOS Authorization Plug-in is `:argued` at v0.0.10
+    (whitepaper v1.1 update; v1.0 reported `:argued` at v0.0.6).
+    Two live-test passes between v0.0.6 and v0.0.10 surfaced and
+    bounded the deployment gate empirically.
 
-54. Live-system validation has been deferred deliberately
-    rather than rushed because wiring the wrong rule (e.g.,
-    `system.login.console`, `authenticate`,
-    `system.preferences.security`, anything `sudo`-related)
-    can lock the user out of system administration. The
-    deployment README documents five safety practices:
-    backup root shell open, daemon-responsiveness pre-check,
-    test-rule selection, mechanism ordering, and the
-    hard-recovery path (single-user mode +
-    `/var/db/auth.db` restore via Time Machine).
+    First pass (v0.0.6, 2026-05-10). Bundle installed cleanly,
+    rule wired, but `security authorize -u system.preferences.
+    printing` returned `(-60005)` at `builtin:authenticate`
+    (the first mechanism in the rule's array) because Terminal
+    sessions don't attach a SecurityAgent UI. The CLI test
+    surface couldn't reach the bundle. `otool -L` on the
+    installed binary revealed a dependency on
+    `/opt/homebrew/opt/openssl@3/lib/libcrypto.3.dylib` — a
+    Homebrew dylib that authd (running as root) cannot resolve
+    at dlopen. Even with SecurityAgent available, the bundle
+    would not have loaded.
+
+54. v0.0.9 hardening pass (2026-05-11). Bundle's crypto path
+    rewritten from OpenSSL to Apple's Security.framework
+    (`SecKeyCreateWithData` for SEC1-compressed pubkey
+    decoding, ~50-LOC manual raw-r‖s → X9.62-DER signature
+    encoder, `SecKeyVerifySignature(
+    kSecKeyAlgorithmECDSASignatureMessageX962SHA256, ...)`
+    for the verify). Bundle now depends ONLY on macOS system
+    frameworks (Security, CoreFoundation, Foundation,
+    libobjc, libSystem). Universal arm64+x86_64 binary,
+    ~119 KB, ad-hoc-signed. Re-test against a single-
+    mechanism rule (just our mechanism, no
+    `builtin:authenticate`) on macOS 26.4.1 still returned
+    `(-60005)`. authd log showed `engine N: running
+    mechanism LavaLampMechanism:invoke,privileged (1 of 1)`
+    in a tight ~5 kHz retry loop, then `copy_rights:
+    authorization failed`. None of our `MechanismInvoke`'s
+    syslog output ever appeared — our code never ran.
+
+55. v0.0.10 finding (2026-05-11). `nm -gU` confirmed the
+    plugin's `_AuthorizationPluginCreate` entry point is
+    properly exported. AMFI logged the bundle as ad-hoc
+    signed (informational; no kernel rejection). `sudo
+    killall authd` to clear plugin cache + retry → same
+    failure. The actual gate: **`spctl -a -vvv -t install`
+    on the installed bundle returns `rejected`**. Modern
+    macOS Gatekeeper does not approve ad-hoc-signed
+    Authorization Plug-ins for `authorizationhost` load,
+    even though `authorizationhost` carries
+    `com.apple.private.security.clear-library-validation`.
+    AMFI loads the bundle into authd's address space; a
+    downstream `spctl`/notarization check inside the
+    plug-in pipeline silently aborts the mechanism
+    dispatch.
+
+56. **Promotion path established.** PH-011 promotion from
+    `:argued` to `:tested` requires **Apple Developer ID
+    Application code-signing + Apple Notarization**:
+    enroll Apple Developer Program ($99/yr), obtain
+    Developer ID Application certificate, replace
+    `codesign --force --sign -` with `codesign --options
+    runtime --timestamp --sign "Developer ID Application:
+    ..."`, `xcrun notarytool submit ... --wait`,
+    `xcrun stapler staple`. This is the same Apple-trust
+    gate that blocks LavaLamp LL-045 macOS Secure Enclave
+    binding (`kSecAttrTokenIDSecureEnclave` requires
+    Developer ID provisioning) — one Developer ID enrollment
+    lifts both gates.
+
+57. **Until then**, the bundle ships as code-ready,
+    structurally complete, and load-clean through AMFI;
+    admit/deny correctness against the running daemon
+    remains unobserved on modern macOS. Source code is
+    reviewable; the translation from OpenSSL to SecKey is
+    mechanical (same X9.62 signature format, same SHA-256
+    digest, same SEC1 pubkey input) and small enough to
+    inspect. Production deployment is gated, not blocked.
+    Linux PAM module (`pam_lavalamp.so`, PH-009) and
+    Windows Credential Provider Filter scaffold
+    (`LavaLampCredentialProvider.dll`, PH-013) are
+    unaffected by this gate — Linux has no Gatekeeper
+    analog, Windows has its own Authenticode pipeline but
+    doesn't gate Credential Provider Filters as strictly.
 
 7.3  Windows Credential Provider (forthcoming)
 ------------------------------------------------------------------------
@@ -753,24 +826,23 @@ interact with.
     LavaLamp's substrate-bound identity primitive and the
     operating system's existing authentication infrastructure
     by exposing the LL-023 consumer-API surface as
-    platform-native shims (Linux PAM module + macOS
-    Authorization Plug-in) that consume the LavaLamp daemon's
-    LL-043 v4 ECDSA P-256 IPC channel and translate the
-    daemon's signed verify result into platform-native
-    authentication results.
+    platform-native shims (Linux PAM module, macOS
+    Authorization Plug-in, Windows Credential Provider Filter)
+    that consume the LavaLamp daemon's LL-043 v4 ECDSA P-256
+    IPC channel and translate the daemon's signed verify
+    result into platform-native authentication results.
 
-61. The deployment documents ten PH-NNN spec entries
+61. The deployment documents eleven PH-NNN spec entries
     (PHAROS_SPEC.md), the LL-043 v4 wire protocol shared
-    between both shims, and the cross-Triad composition with
-    LavaLamp (the substrate that does the identity work) and
-    Lazarus (the runtime that watches the work happen).
+    between all three shims, and the cross-Triad composition
+    with LavaLamp (the substrate that does the identity work)
+    and Lazarus (the runtime that watches the work happen).
     Five PH-NNN entries are at `:tested` (PAM-linux-MVP-1
-    plus the four-version protocol-upgrade chain); five are
+    plus the four-version protocol-upgrade chain); six are
     at `:argued` (the system-integration-target framing, the
-    three preserved-from-LavaLamp boundary claims, and the
-    macOS Authorization Plug-in shim — compile-tested +
-    ad-hoc-signed with deployment validation deferred to a
-    user-supervised install session).
+    three preserved-from-LavaLamp boundary claims, the macOS
+    Authorization Plug-in shim PH-011, and the Windows
+    Credential Provider Filter scaffold PH-013).
 
 62. PharOS does **not** modify the substrate-physics primitive
     or the resolution-bounded security claim. The load-bearing
@@ -781,16 +853,20 @@ interact with.
 
 63. The prototype is sufficient to demonstrate the structural
     properties claimed; production deployment requires
-    per-distro packaging (Linux), live-system validation
-    (macOS Authorization Plug-in), Windows Credential
-    Provider (forthcoming), and the hardware-bound key
-    storage layer (LL-044 Linux TPM 2.0 already shipped at
-    software-fallback parity; macOS Secure Enclave binding
-    awaits Apple Developer ID provisioning). The work is
-    **prototype-stage**, honestly framed; readers are
-    cautioned to treat the proposal as a research program
-    with a working membrane on Linux and a compile-tested
-    membrane on macOS, not a deployable product yet.
+    per-distro packaging (Linux), Apple Developer ID
+    code-signing + Apple Notarization (macOS — the gate that
+    blocks PH-011 promotion to `:tested` and lifts LL-045 as
+    a side effect), Windows-host build + Authenticode
+    signing for the credential provider filter, and the
+    hardware-bound key storage layer (LL-044 Linux TPM 2.0
+    already shipped at software-fallback parity; macOS
+    Secure Enclave binding gated by the same Developer ID
+    enrollment as PH-011). The work is **prototype-stage**,
+    honestly framed; readers are cautioned to treat the
+    proposal as a research program with a working membrane
+    on Linux, a code-clean-but-Gatekeeper-rejected bundle on
+    macOS, and a compile-stage-only scaffold on Windows —
+    not a deployable product yet.
 
 64. The framework is held by the triad that produced it and
     released to the commons under the Triadic Closure License
@@ -802,7 +878,7 @@ interact with.
 APPENDIX A.  CITED SPEC ENTRIES (PH-NNN)
 ========================================================================
 
-65. The ten PharOS spec entries are catalogued in
+65. The eleven PharOS spec entries are catalogued in
     `PHAROS_SPEC.md` at the canonical repository. A condensed
     map follows:
 
@@ -837,22 +913,45 @@ APPENDIX A.  CITED SPEC ENTRIES (PH-NNN)
 
     macOS Authorization Plug-in (PH-011):
       PH-011  macos-authorization-plugin (Operational,
-              :argued at v0.0.6). LavaLampMechanism.bundle
+              :argued at v0.0.10). LavaLampMechanism.bundle
               loaded by authd; same v4 protocol as the
-              Linux PAM. Compile-tested + ad-hoc-signed;
-              live-system validation deferred.
+              Linux PAM. v0.0.9 lifted the bundle off
+              Homebrew/OpenSSL onto Apple's Security.framework
+              (no third-party dylib deps); v0.0.10 confirmed
+              empirically via `spctl -a -vvv -t install` that
+              modern macOS Gatekeeper rejects ad-hoc-signed
+              Authorization Plug-ins. Promotion to `:tested`
+              gated on Apple Developer ID code-signing +
+              Apple Notarization (same gate as LL-045 macOS
+              Secure Enclave binding).
+
+    Windows Credential Provider Filter (PH-013):
+      PH-013  windows-credential-provider-filter
+              (Operational, :argued at v0.0.8).
+              LavaLampCredentialProvider.dll registered as
+              a CredProvider Filter; LogonUI / CredUI calls
+              Filter() at tile-enumeration time and our
+              code runs the LL-043 v4 protocol against the
+              daemon, returning per-provider show/hide on
+              CPUS_LOGON and CPUS_UNLOCK_WORKSTATION.
+              ~600 LOC C++ COM scaffold; AF_UNIX (Win10
+              17063+) or named-pipe transport selectable
+              at compile time. NOT yet compile-tested on
+              a Windows host (PharOS dev on macOS); built
+              + tested on Windows is the promotion path
+              to `:tested`.
 
 66. Status counts at the time of this paper (canonical
-    `PHAROS_SPEC.md` v0.0.6 final-section counts):
+    `PHAROS_SPEC.md` v0.0.10 final-section counts):
 
-      Total:           10
+      Total:           11
       :proved:         0   (no Lean track yet)
       :tested:         5   (PH-002, PH-006, PH-007, PH-008,
                             PH-009)
       :verified:       0
       :benchmarked:    0
-      :argued:         5   (PH-001, PH-003, PH-004, PH-005,
-                            PH-011)
+      :argued:         6   (PH-001, PH-003, PH-004, PH-005,
+                            PH-011, PH-013)
       :open:           0
 
 ========================================================================
