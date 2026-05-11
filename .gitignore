@@ -25,3 +25,8 @@ dashboard.md
 # CI / build outputs
 build/
 target/
+
+# macOS Authorization Plug-in build outputs (source-of-truth lives
+# in LavaLampMechanism.m + Makefile + Info.plist; rebuilt by `make`)
+src/macos/LavaLampMechanism.bundle/Contents/MacOS/
+src/macos/LavaLampMechanism.bundle/Contents/_CodeSignature/
