@@ -30,3 +30,6 @@ target/
 # in LavaLampMechanism.m + Makefile + Info.plist; rebuilt by `make`)
 src/macos/LavaLampMechanism.bundle/Contents/MacOS/
 src/macos/LavaLampMechanism.bundle/Contents/_CodeSignature/
+
+# Lean build artifacts
+src/lean4/.lake/

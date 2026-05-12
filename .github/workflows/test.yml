@@ -5,6 +5,10 @@
 #     and confirms it ad-hoc-signs cleanly (PH-011 build-smoke).
 #     authd-mediated runtime testing remains user-supervised
 #     (lockout risk); CI catches build-breakage only.
+#   - lean-membrane: ubuntu-latest, runs `lake build` in
+#     src/lean4/ against the hermetic Lean toolchain pinned at
+#     v4.29.1 (no Mathlib). Validates PH-004 LL-017-membrane-
+#     preservation Lean theorems on every push.
 #
 # Windows Credential Provider (forthcoming PH-NNN) will add its
 # own CI job when that platform ships.
@@ -73,3 +77,20 @@ jobs:
         run: |
           codesign --verify --verbose=2 LavaLampMechanism.bundle
           codesign -dvv LavaLampMechanism.bundle 2>&1 | grep -q "Signature=adhoc"
+
+  lean-membrane:
+    name: PH-004 — Lean proof (Membrane.lean)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Lean toolchain via elan
+        run: |
+          curl -sSf https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh \
+            | sh -s -- -y --default-toolchain none
+          echo "$HOME/.elan/bin" >> $GITHUB_PATH
+
+      - name: lake build (Membrane.lean)
+        working-directory: src/lean4
+        run: lake build
