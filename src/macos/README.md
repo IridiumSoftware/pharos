@@ -31,7 +31,7 @@ This bundle:
 ## Build
 
 ```
-cd /Users/aarongreen/Desktop/pharos/src/macos
+cd src/macos
 make
 ```
 

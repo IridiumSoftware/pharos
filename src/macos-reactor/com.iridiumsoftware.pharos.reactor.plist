@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.iridiumsoftware.pharos.reactor</string>
+
+    <!--
+      PharOS macOS post-authentication reactor (PH-019 MVP-1).
+
+      Replace REACTOR_DIR with the absolute path to your
+      src/macos-reactor/ checkout before `launchctl load`. The
+      bundled install script will not patch this for you; the path
+      embedded here is dev-machine-specific.
+
+      To uninstall:
+        launchctl unload ~/Library/LaunchAgents/com.iridiumsoftware.pharos.reactor.plist
+        rm ~/Library/LaunchAgents/com.iridiumsoftware.pharos.reactor.plist
+    -->
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/zsh</string>
+        <string>-c</string>
+        <string>cd REACTOR_DIR &amp;&amp; exec /opt/homebrew/bin/python3 -u pharos_reactor.py</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!--
+      KeepAlive: false. We do NOT auto-restart on crash. If the
+      reactor dies, we want operator visibility, not silent retry —
+      a crash inside the verify pipeline could indicate the LavaLamp
+      daemon has been replaced by an attacker, and silent restart
+      would mask that signal.
+    -->
+    <key>KeepAlive</key>
+    <false/>
+
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <!--
+      TCC-safe log paths. Avoid ~/Desktop and ~/Documents because
+      LaunchAgents spawn outside the user's GUI session and macOS TCC
+      blocks access to those directories from non-graphical contexts.
+      ~/.pharos-reactor/ is created by pharos_reactor.py on first run.
+    -->
+    <key>StandardOutPath</key>
+    <string>/Users/USERNAME/.pharos-reactor/reactor.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/USERNAME/.pharos-reactor/reactor.err</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>LL_REACTOR_SOURCE</key>
+        <string>log_stream</string>
+        <key>LL_REACTOR_LOG_LEVEL</key>
+        <string>INFO</string>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+</dict>
+</plist>

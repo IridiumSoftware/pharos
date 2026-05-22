@@ -33,3 +33,23 @@ src/macos/LavaLampMechanism.bundle/Contents/_CodeSignature/
 
 # Lean build artifacts
 src/lean4/.lake/
+
+# Python virtualenvs (PH-019 macos-reactor dev iteration)
+.venv/
+**/.venv/
+__pycache__/
+**/__pycache__/
+*.pyc
+
+# Notarized bundle stapled ticket (Apple-issued, per-build)
+src/macos/LavaLampMechanism.bundle/Contents/CodeResources
+
+# Notarytool input artefacts (regenerated each release)
+src/macos/LavaLampMechanism.bundle.zip
+src/macos/LavaLampMechanism.bundle.zip.log
+
+# Local overrides for signing identity (gitignored Makefile.local pattern)
+src/macos/Makefile.local
+
+# Whitepaper PDF build output (LaTeX source is canonical)
+lavalamp_whitepaper.pdf
