@@ -59,6 +59,15 @@
         <string>log_stream</string>
         <key>LL_REACTOR_LOG_LEVEL</key>
         <string>INFO</string>
+        <!--
+          UNREACHABLE escalation: after N consecutive UNREACHABLE /
+          TIMEOUT results, dispatch a REJECT-equivalent lock+kill
+          reaction. Closes the "attacker killed lavalampd to evade
+          detection" blind spot. Default 5 (~25s at 5s throttle);
+          raise for noisier daemons, lower for stricter posture.
+        -->
+        <key>LL_REACTOR_UNREACHABLE_LIMIT</key>
+        <string>5</string>
         <key>PATH</key>
         <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
     </dict>

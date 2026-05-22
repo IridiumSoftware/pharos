@@ -151,5 +151,104 @@ class ReactorPipelineTest(unittest.TestCase):
         )
 
 
+class DispatchEscalationTest(unittest.TestCase):
+    """Direct unit tests for _dispatch_reaction's UNREACHABLE escalation.
+
+    Bypasses the event source / verify pipeline; exercises the
+    cross-event state-machine in isolation.
+    """
+
+    def setUp(self):
+        logging.disable(logging.CRITICAL)
+
+    def tearDown(self):
+        logging.disable(logging.NOTSET)
+
+    def test_first_unreachable_does_not_fire(self):
+        from lavalamp_client import DaemonResult
+        fired, new_count = pharos_reactor._dispatch_reaction(
+            DaemonResult.UNREACHABLE,
+            kill=True, dry_run=True,
+            unreachable_count=0, unreachable_limit=5,
+        )
+        self.assertFalse(fired)
+        self.assertEqual(new_count, 1)
+
+    def test_consecutive_unreachable_below_limit_does_not_fire(self):
+        from lavalamp_client import DaemonResult
+        count = 0
+        for _ in range(4):  # limit is 5; 4 misses should not fire
+            fired, count = pharos_reactor._dispatch_reaction(
+                DaemonResult.UNREACHABLE,
+                kill=True, dry_run=True,
+                unreachable_count=count, unreachable_limit=5,
+            )
+            self.assertFalse(fired)
+        self.assertEqual(count, 4)
+
+    def test_fifth_unreachable_escalates(self):
+        from lavalamp_client import DaemonResult
+        count = 0
+        last_fired = False
+        for _ in range(5):  # 5th miss at limit=5 should escalate
+            last_fired, count = pharos_reactor._dispatch_reaction(
+                DaemonResult.UNREACHABLE,
+                kill=True, dry_run=True,
+                unreachable_count=count, unreachable_limit=5,
+            )
+        self.assertTrue(last_fired)
+        self.assertEqual(count, 0)  # reset after escalation
+
+    def test_accept_resets_counter(self):
+        from lavalamp_client import DaemonResult
+        count = 0
+        # 3 misses, then ACCEPT, then a 4th miss should NOT escalate.
+        for _ in range(3):
+            _, count = pharos_reactor._dispatch_reaction(
+                DaemonResult.UNREACHABLE,
+                kill=True, dry_run=True,
+                unreachable_count=count, unreachable_limit=5,
+            )
+        self.assertEqual(count, 3)
+        _, count = pharos_reactor._dispatch_reaction(
+            DaemonResult.ACCEPT,
+            kill=True, dry_run=True,
+            unreachable_count=count, unreachable_limit=5,
+        )
+        self.assertEqual(count, 0)
+        # Now 4 more misses should not yet escalate.
+        last_fired = False
+        for _ in range(4):
+            last_fired, count = pharos_reactor._dispatch_reaction(
+                DaemonResult.UNREACHABLE,
+                kill=True, dry_run=True,
+                unreachable_count=count, unreachable_limit=5,
+            )
+        self.assertFalse(last_fired)
+        self.assertEqual(count, 4)
+
+    def test_reject_resets_counter_and_fires(self):
+        from lavalamp_client import DaemonResult
+        count = 2  # mid-streak
+        fired, new_count = pharos_reactor._dispatch_reaction(
+            DaemonResult.REJECT,
+            kill=True, dry_run=True,
+            unreachable_count=count, unreachable_limit=5,
+        )
+        self.assertTrue(fired)
+        self.assertEqual(new_count, 0)
+
+    def test_unreachable_limit_one_fires_immediately(self):
+        # Stricter posture: limit=1 means any UNREACHABLE escalates.
+        from lavalamp_client import DaemonResult
+        fired, new_count = pharos_reactor._dispatch_reaction(
+            DaemonResult.UNREACHABLE,
+            kill=True, dry_run=True,
+            unreachable_count=0, unreachable_limit=1,
+        )
+        self.assertTrue(fired)
+        self.assertEqual(new_count, 0)
+
+
 if __name__ == "__main__":
     unittest.main()

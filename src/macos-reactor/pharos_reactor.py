@@ -76,6 +76,23 @@ LOG_STREAM_PREDICATE = (
 # events; one reaction per cluster is correct).
 REACTION_THROTTLE_S = 5.0
 
+# Escalation threshold for persistent UNREACHABLE.
+#
+# react_to_timeout is intentionally a no-op on a single miss — a
+# legitimate `lavalampd` restart is a normal event and we don't want
+# to evict the user's session for it. But an attacker who kills the
+# daemon and stays logged in is the exact gap this reactor exists to
+# close. Compromise: after N consecutive UNREACHABLE / TIMEOUT
+# results, treat the substrate as effectively REJECT and dispatch the
+# full lock+kill reaction. Reset to 0 on any non-unreachable result.
+#
+# Default 5: at ~5s throttle ≈ 25s elapsed, comfortably longer than a
+# clean daemon restart (LL-039 daemon comes up in <2s) but short
+# enough to catch malicious shutdown before the attacker can
+# accomplish much. Override via env LL_REACTOR_UNREACHABLE_LIMIT or
+# CLI --unreachable-limit.
+UNREACHABLE_ESCALATION_DEFAULT = 5
+
 
 def _iter_log_stream() -> Iterator[str]:
     """Yield each line of `log stream` output as the events arrive.
@@ -119,34 +136,58 @@ def _dispatch_reaction(
     *,
     kill: bool,
     dry_run: bool,
-) -> bool:
-    """Dispatch the reaction matching `result`. Returns True if anything fired."""
+    unreachable_count: int,
+    unreachable_limit: int,
+) -> tuple[bool, int]:
+    """Dispatch the reaction matching `result`.
+
+    Returns (fired, new_unreachable_count). The caller threads
+    new_unreachable_count back in on the next event — escalation of
+    persistent UNREACHABLE / TIMEOUT requires cross-event state.
+    """
     if result == DaemonResult.ACCEPT:
         log.debug("substrate ACCEPT — no reaction")
-        return False
+        return (False, 0)
     if result == DaemonResult.REJECT:
         log.warning("substrate REJECT — locking and killing session")
         react_to_reject(kill=kill, dry_run=dry_run)
-        return True
+        return (True, 0)
     if result == DaemonResult.STALE:
         log.warning("substrate STALE — forcing re-auth")
         react_to_stale(dry_run=dry_run)
-        return True
+        return (True, 0)
     if result in (DaemonResult.TIMEOUT, DaemonResult.UNREACHABLE):
+        new_count = unreachable_count + 1
+        if new_count >= unreachable_limit:
+            log.error(
+                "substrate %s for %d consecutive events (limit %d) — "
+                "escalating to REJECT-equivalent reaction (attacker "
+                "may have killed lavalampd to evade detection)",
+                result.name, new_count, unreachable_limit,
+            )
+            react_to_reject(kill=kill, dry_run=dry_run)
+            # Reset so a stuck-unreachable state fires one reaction
+            # per throttle window, not continuously.
+            return (True, 0)
+        log.warning(
+            "substrate %s (%d/%d consecutive) — no reaction yet",
+            result.name, new_count, unreachable_limit,
+        )
         react_to_timeout(dry_run=dry_run)
-        return False
+        return (False, new_count)
     if result == DaemonResult.BAD_SIG:
         log.error("substrate BAD_SIG — daemon response failed signature check")
         react_to_reject(kill=kill, dry_run=dry_run)
-        return True
+        return (True, 0)
     log.error("unhandled DaemonResult: %r", result)
-    return False
+    return (False, unreachable_count)
 
 
 def reactor_loop(
     *,
     kill_on_reject: bool = True,
     dry_run: bool = False,
+    unreachable_limit: int = UNREACHABLE_ESCALATION_DEFAULT,
     event_source: Optional[Iterator[str]] = None,
 ) -> None:
     """Main loop. Subscribes to events, verifies on each, reacts."""
@@ -154,6 +195,7 @@ def reactor_loop(
         event_source = _iter_log_stream()
 
     last_reaction_at = 0.0
+    consecutive_unreachable = 0
 
     for line in event_source:
         if not _matches_auth_event(line):
@@ -169,8 +211,19 @@ def reactor_loop(
         result = verify_lavalamp_substrate()
         log.info("verify result: %s", result.name)
 
-        fired = _dispatch_reaction(
-            result, kill=kill_on_reject, dry_run=dry_run,
+        # Log substrate recovery (informational; not a reaction).
+        if consecutive_unreachable > 0 and result not in (
+            DaemonResult.TIMEOUT, DaemonResult.UNREACHABLE,
+        ):
+            log.info("substrate reachable again after %d consecutive misses",
+                     consecutive_unreachable)
+
+        fired, consecutive_unreachable = _dispatch_reaction(
+            result,
+            kill=kill_on_reject,
+            dry_run=dry_run,
+            unreachable_count=consecutive_unreachable,
+            unreachable_limit=unreachable_limit,
         )
         if fired:
             last_reaction_at = now
@@ -202,6 +255,19 @@ def main() -> int:
         help="On REJECT, lock screen only; do NOT kill the GUI session.",
     )
     parser.add_argument(
+        "--unreachable-limit", type=int,
+        default=int(os.environ.get(
+            "LL_REACTOR_UNREACHABLE_LIMIT",
+            str(UNREACHABLE_ESCALATION_DEFAULT),
+        )),
+        help=(
+            "Consecutive UNREACHABLE/TIMEOUT events before escalating "
+            f"to a REJECT-equivalent reaction. Default: "
+            f"{UNREACHABLE_ESCALATION_DEFAULT}. Set to a very large "
+            "number (e.g. 10000) to effectively disable escalation."
+        ),
+    )
+    parser.add_argument(
         "--log-level", default=os.environ.get("LL_REACTOR_LOG_LEVEL", "INFO"),
         help="Logging level (DEBUG/INFO/WARNING/ERROR). Default: INFO.",
     )
@@ -223,10 +289,15 @@ def main() -> int:
         )
         return 2
 
+    if args.unreachable_limit < 1:
+        log.error("--unreachable-limit must be ≥ 1 (got %d)",
+                  args.unreachable_limit)
+        return 2
+
     log.info(
         "starting PharOS reactor — PH-019 MVP-1 (log stream source); "
-        "dry_run=%s, kill_on_reject=%s",
-        args.dry_run, not args.no_kill,
+        "dry_run=%s, kill_on_reject=%s, unreachable_limit=%d",
+        args.dry_run, not args.no_kill, args.unreachable_limit,
     )
     _install_signal_handlers()
 
@@ -234,6 +305,7 @@ def main() -> int:
         reactor_loop(
             kill_on_reject=not args.no_kill,
             dry_run=args.dry_run,
+            unreachable_limit=args.unreachable_limit,
         )
     except KeyboardInterrupt:
         log.info("interrupted — exiting")

@@ -80,6 +80,36 @@ LL-002 visual-security decoupling at the OS layer.
   itself, alternative LaunchDaemon mode) are out of scope
   for MVP-1.
 
+**Closed gap: attacker kills `lavalampd` to evade detection.**
+
+A naive post-auth reactor with `react_to_timeout = no-op` is
+blind to an attacker who shuts the substrate daemon down:
+every verify returns UNREACHABLE, and the reactor never
+fires. MVP-1 closes this gap with an **UNREACHABLE-escalation
+counter**: after `LL_REACTOR_UNREACHABLE_LIMIT` (default 5)
+consecutive UNREACHABLE / TIMEOUT results, the reactor treats
+the substrate as effectively REJECT and dispatches the full
+lock+kill reaction. Counter resets to 0 on any non-unreachable
+result.
+
+At the default (5 events × ~5s throttle ≈ 25s elapsed),
+escalation triggers comfortably longer than a legitimate
+`lavalampd` restart (LL-039 daemon comes up in <2s) but short
+enough to catch malicious shutdown before the attacker can
+accomplish much. Tunable via env or CLI:
+
+```sh
+# Stricter (3 events ≈ 15s).
+launchctl setenv LL_REACTOR_UNREACHABLE_LIMIT 3
+
+# Looser (20 events ≈ 100s — for noisy daemons under
+# development).
+python3 pharos_reactor.py --foreground --unreachable-limit 20
+
+# Effectively disabled (10000 events ≈ 14h before escalation).
+python3 pharos_reactor.py --foreground --unreachable-limit 10000
+```
+
 **Cannot defend.**
 
 - *Pre-auth blocking.* Apple closed this surface for 3rd
