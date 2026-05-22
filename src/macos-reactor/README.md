@@ -187,6 +187,43 @@ Before running the reactor against a live LavaLamp daemon:
    `launchctl unload ~/Library/LaunchAgents/com.iridium
    software.pharos.reactor.plist`. The plist supports
    `KeepAlive: false` semantics (no auto-relaunch).
+6. **Harden the plist against same-UID tampering
+   (PH-020 MVP-1).** Once you're satisfied the reactor is
+   loaded and behaving, run the following three commands
+   to prevent any same-UID attacker from unloading or
+   editing the LaunchAgent before authenticating:
+
+   ```sh
+   sudo chown root:wheel ~/Library/LaunchAgents/com.iridiumsoftware.pharos.reactor.plist
+   sudo chmod 644 ~/Library/LaunchAgents/com.iridiumsoftware.pharos.reactor.plist
+   sudo chflags schg ~/Library/LaunchAgents/com.iridiumsoftware.pharos.reactor.plist
+   ```
+
+   `schg` is the system-immutable flag — only root in
+   single-user mode (or after `csrutil disable`) can clear
+   it. Combined with `root:wheel` ownership and `0644`
+   perms, the user can read the plist (so launchd loads
+   it normally) but cannot modify or delete it. The
+   reactor still runs as the user (the plist's `UserName`
+   field governs that); only the *plist itself* becomes
+   tamper-resistant.
+
+   **To uninstall after hardening**, reverse in order:
+
+   ```sh
+   sudo chflags noschg ~/Library/LaunchAgents/com.iridiumsoftware.pharos.reactor.plist
+   sudo chown $(whoami):staff ~/Library/LaunchAgents/com.iridiumsoftware.pharos.reactor.plist
+   launchctl unload ~/Library/LaunchAgents/com.iridiumsoftware.pharos.reactor.plist
+   rm ~/Library/LaunchAgents/com.iridiumsoftware.pharos.reactor.plist
+   ```
+
+   The full PH-020 MVP-2 (root-owned LaunchDaemon
+   watchdog) is queued for a separate release; MVP-1
+   filesystem hardening is the immediately-available
+   mitigation and is the right default if you intend to
+   leave the reactor running indefinitely. Honest scope:
+   MVP-1 does NOT defend against root-equivalent
+   attackers — see PHAROS_SPEC.md PH-020 Notes.
 
 ## MVP-2 upgrade path (gated on Apple entitlement)
 
