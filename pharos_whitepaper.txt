@@ -1011,6 +1011,20 @@ APPENDIX B.  SUPPORTING MATERIAL
     May 2026. github.com/IridiumSoftware/possibilistic-
     security.
 
+    von Neumann, J. (1952/1956). 'Probabilistic Logics and
+    the Synthesis of Reliable Organisms from Unreliable
+    Components.' Lectures delivered at the California Institute
+    of Technology, January 4-15, 1952; notes by R. S. Pierce.
+    Published in C. E. Shannon and J. McCarthy (eds.), Automata
+    Studies, Annals of Mathematics Studies No. 34, Princeton
+    University Press, 1956, pp. 43-98. Foundational reference
+    for the entire Triad Deployments thesis. PharOS's membrane
+    architecture (PH-001..PH-018) instantiates von Neumann's
+    multiplexing pattern at the OS-authentication layer: a
+    Bool-valued membrane wraps a 3-state DaemonResult, with the
+    LavaLamp-supplied substrate residue acting as the reliable
+    bundle excitation level fed across the trust boundary.
+
 71. The canonical PharOS repository is
     github.com/IridiumSoftware/pharos; this paper, the
     source code, the test suite, and the deployment
