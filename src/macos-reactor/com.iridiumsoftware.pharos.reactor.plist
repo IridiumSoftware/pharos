@@ -9,13 +9,20 @@
     <!--
       PharOS macOS post-authentication reactor (PH-019 MVP-1).
 
-      Replace REACTOR_DIR with the absolute path to your
-      src/macos-reactor/ checkout before `launchctl load`. The
-      bundled install script will not patch this for you; the path
-      embedded here is dev-machine-specific.
+      Replace REACTOR_DIR (the only placeholder) with the absolute
+      path to your src/macos-reactor/ checkout before installing.
+      Logs and the venv python resolve via $HOME / the checkout at
+      runtime, so there is nothing else to edit.
 
-      To uninstall:
-        launchctl unload ~/Library/LaunchAgents/com.iridiumsoftware.pharos.reactor.plist
+      Install (RunAtLoad starts it on bootstrap — do NOT
+      `launchctl kickstart -k` from an interactive shell; on macOS 26
+      a kickstarted gui agent inherits the caller's tty for stdout):
+        cp this file to ~/Library/LaunchAgents/ (replacing REACTOR_DIR)
+        launchctl bootstrap gui/$(id -u) \
+          ~/Library/LaunchAgents/com.iridiumsoftware.pharos.reactor.plist
+
+      Uninstall:
+        launchctl bootout gui/$(id -u)/com.iridiumsoftware.pharos.reactor
         rm ~/Library/LaunchAgents/com.iridiumsoftware.pharos.reactor.plist
     -->
 
@@ -23,7 +30,17 @@
     <array>
         <string>/bin/zsh</string>
         <string>-c</string>
-        <string>cd REACTOR_DIR &amp;&amp; exec /opt/homebrew/bin/python3 -u pharos_reactor.py</string>
+        <!--
+          Use the project venv python: the system /opt/homebrew/bin/
+          python3 does NOT have the `ecdsa` dependency. Logs are
+          redirected in-shell (>>) rather than via StandardOutPath
+          below, because macOS 26 does not reliably apply those keys
+          to gui-domain agents (a kickstart-launched agent inherits
+          the caller's tty; a RunAtLoad agent gets /dev/null). The
+          shell redirect binds python's fd 1/2 to the log file
+          directly, so observability holds regardless of launch path.
+        -->
+        <string>mkdir -p "$HOME/.pharos-reactor" &amp;&amp; cd REACTOR_DIR &amp;&amp; exec .venv/bin/python -u pharos_reactor.py &gt;&gt; "$HOME/.pharos-reactor/reactor.log" 2&gt;&amp;1</string>
     </array>
 
     <key>RunAtLoad</key>
@@ -60,14 +77,19 @@
         <key>LL_REACTOR_LOG_LEVEL</key>
         <string>INFO</string>
         <!--
-          UNREACHABLE escalation: after N consecutive UNREACHABLE /
-          TIMEOUT results, dispatch a REJECT-equivalent lock+kill
-          reaction. Closes the "attacker killed lavalampd to evade
-          detection" blind spot. Default 5 (~25s at 5s throttle);
-          raise for noisier daemons, lower for stricter posture.
+          Grace window (2026-05-31 model): the substrate must be
+          CONTINUOUSLY bad (REJECT/STALE/UNREACHABLE/TIMEOUT) for this
+          many seconds before the lock+kill reaction fires. Any ACCEPT
+          resets the timer; BAD_SIG bypasses it (true tamper signal).
+          60s absorbs daemon restarts (~2s outage) and load-induced
+          nuisance REJECTs (2 in 9,790 verifies, both transient) while
+          still reaping a genuinely-bad substrate. Recovery from a
+          mistaken lock is physically expensive (log back in + remember
+          to unload the reactor), so the trigger is deliberately slow.
+          Set very large (e.g. 86400) to observe without ever locking.
         -->
-        <key>LL_REACTOR_UNREACHABLE_LIMIT</key>
-        <string>5</string>
+        <key>LL_REACTOR_GRACE_SECONDS</key>
+        <string>60</string>
         <key>PATH</key>
         <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
     </dict>

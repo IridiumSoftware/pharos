@@ -35,11 +35,12 @@ import time
 from typing import Iterator, Optional
 
 from lavalamp_client import DaemonResult, verify_lavalamp_substrate
-from reactions import (
-    react_to_reject,
-    react_to_stale,
-    react_to_timeout,
-)
+# Only react_to_reject is wired into dispatch now: the unified grace
+# model (2026-05-31) routes every bad substrate state through the single
+# lock+kill reaction. react_to_stale / react_to_timeout remain defined
+# and unit-tested in reactions.py for possible future differentiated
+# responses, but are intentionally not imported here.
+from reactions import react_to_reject
 
 log = logging.getLogger("pharos_reactor")
 
@@ -76,22 +77,35 @@ LOG_STREAM_PREDICATE = (
 # events; one reaction per cluster is correct).
 REACTION_THROTTLE_S = 5.0
 
-# Escalation threshold for persistent UNREACHABLE.
+# Wall-clock grace window before any lock+kill reaction fires.
 #
-# react_to_timeout is intentionally a no-op on a single miss — a
-# legitimate `lavalampd` restart is a normal event and we don't want
-# to evict the user's session for it. But an attacker who kills the
-# daemon and stays logged in is the exact gap this reactor exists to
-# close. Compromise: after N consecutive UNREACHABLE / TIMEOUT
-# results, treat the substrate as effectively REJECT and dispatch the
-# full lock+kill reaction. Reset to 0 on any non-unreachable result.
+# Design (2026-05-31, replacing the earlier instant-REJECT +
+# consecutive-UNREACHABLE-count model). The lock+kill reaction is
+# *expensive to recover from* on a personal machine: the user must
+# physically log back in AND remember to unload the reactor, which
+# takes real wall-clock time. So the reactor must be slow to pull the
+# trigger and forgiving of transient badness.
 #
-# Default 5: at ~5s throttle ≈ 25s elapsed, comfortably longer than a
-# clean daemon restart (LL-039 daemon comes up in <2s) but short
-# enough to catch malicious shutdown before the attacker can
-# accomplish much. Override via env LL_REACTOR_UNREACHABLE_LIMIT or
-# CLI --unreachable-limit.
-UNREACHABLE_ESCALATION_DEFAULT = 5
+# Unified rule: REJECT, STALE, UNREACHABLE, and TIMEOUT all start a
+# single wall-clock "bad-since" timer. The lock+kill reaction fires
+# only once the substrate has been *continuously* bad for at least
+# GRACE_SECONDS. Any ACCEPT clears the timer. This absorbs:
+#   - daemon restarts (socket gone ~1-2s → UNREACHABLE → the next poll
+#     after restart returns ACCEPT and clears the timer);
+#   - load-induced nuisance REJECTs (empirically 2 in 9,790 verifies
+#     over 10 days, both single transient spikes under heavy load —
+#     neither would survive a 60s continuous-bad requirement).
+#
+# BAD_SIG is the ONE exception: it bypasses the grace and fires
+# immediately. It is a true tamper signal (the daemon's signature
+# failed verification — the daemon was replaced or the socket MITM'd),
+# never a nuisance (0 occurrences in 9,790 verifies), so there is no
+# reason to grant it grace.
+#
+# Default 60s. Override via env LL_REACTOR_GRACE_SECONDS or CLI
+# --grace-seconds. Set very large (e.g. 86400) to keep the reactor
+# observing without ever locking.
+GRACE_SECONDS_DEFAULT = 60.0
 
 
 def _iter_log_stream() -> Iterator[str]:
@@ -131,78 +145,107 @@ def _matches_auth_event(line: str) -> bool:
     return any(pat.search(line) for pat in AUTH_EVENT_PATTERNS)
 
 
+# Bad substrate states that share the wall-clock grace window before
+# lock+kill. BAD_SIG is deliberately excluded — it fires immediately.
+_GRACE_BAD_STATES = (
+    DaemonResult.REJECT,
+    DaemonResult.STALE,
+    DaemonResult.TIMEOUT,
+    DaemonResult.UNREACHABLE,
+)
+
+
 def _dispatch_reaction(
     result: DaemonResult,
     *,
     kill: bool,
     dry_run: bool,
-    unreachable_count: int,
-    unreachable_limit: int,
-) -> tuple[bool, int]:
-    """Dispatch the reaction matching `result`.
+    now: float,
+    bad_since: Optional[float],
+    grace_seconds: float,
+) -> tuple[bool, Optional[float]]:
+    """Dispatch the reaction matching `result` under the grace model.
 
-    Returns (fired, new_unreachable_count). The caller threads
-    new_unreachable_count back in on the next event — escalation of
-    persistent UNREACHABLE / TIMEOUT requires cross-event state.
+    `now` is a monotonic timestamp; `bad_since` is the monotonic time
+    the current unbroken bad streak began (None if the last observed
+    state was good). Returns (fired, new_bad_since); the caller threads
+    new_bad_since back in on the next event — the grace window is
+    cross-event wall-clock state.
+
+    Rule: REJECT / STALE / UNREACHABLE / TIMEOUT all start (or continue)
+    one shared bad-since timer; lock+kill fires only once the substrate
+    has been continuously bad for >= grace_seconds. ACCEPT clears the
+    timer. BAD_SIG bypasses the grace entirely (true tamper signal).
     """
     if result == DaemonResult.ACCEPT:
-        log.debug("substrate ACCEPT — no reaction")
-        return (False, 0)
-    if result == DaemonResult.REJECT:
-        log.warning("substrate REJECT — locking and killing session")
+        if bad_since is not None:
+            log.info("substrate ACCEPT — clearing bad-state grace timer")
+        else:
+            log.debug("substrate ACCEPT — no reaction")
+        return (False, None)
+
+    if result == DaemonResult.BAD_SIG:
+        # True tamper signal — no grace.
+        log.error("substrate BAD_SIG — daemon response failed signature "
+                  "check; locking and killing session immediately")
         react_to_reject(kill=kill, dry_run=dry_run)
-        return (True, 0)
-    if result == DaemonResult.STALE:
-        log.warning("substrate STALE — forcing re-auth")
-        react_to_stale(dry_run=dry_run)
-        return (True, 0)
-    if result in (DaemonResult.TIMEOUT, DaemonResult.UNREACHABLE):
-        new_count = unreachable_count + 1
-        if new_count >= unreachable_limit:
+        return (True, None)
+
+    if result in _GRACE_BAD_STATES:
+        if bad_since is None:
+            log.warning(
+                "substrate %s — starting %.0fs grace timer (no reaction "
+                "yet; an ACCEPT before then clears it)",
+                result.name, grace_seconds,
+            )
+            return (False, now)
+        elapsed = now - bad_since
+        if elapsed >= grace_seconds:
             log.error(
-                "substrate %s for %d consecutive events (limit %d) — "
-                "escalating to REJECT-equivalent reaction (attacker "
-                "may have killed lavalampd to evade detection)",
-                result.name, new_count, unreachable_limit,
+                "substrate bad (%s) continuously for %.0fs (grace %.0fs) "
+                "— locking and killing session",
+                result.name, elapsed, grace_seconds,
             )
             react_to_reject(kill=kill, dry_run=dry_run)
-            # Reset so a stuck-unreachable state fires one reaction
-            # per throttle window, not continuously.
-            return (True, 0)
+            # Reset; the loop's throttle prevents an immediate re-fire.
+            return (True, None)
         log.warning(
-            "substrate %s (%d/%d consecutive) — no reaction yet",
-            result.name, new_count, unreachable_limit,
+            "substrate %s for %.0fs / %.0fs grace — no reaction yet",
+            result.name, elapsed, grace_seconds,
         )
-        react_to_timeout(dry_run=dry_run)
-        return (False, new_count)
-    if result == DaemonResult.BAD_SIG:
-        log.error("substrate BAD_SIG — daemon response failed signature check")
-        react_to_reject(kill=kill, dry_run=dry_run)
-        return (True, 0)
+        return (False, bad_since)
+
     log.error("unhandled DaemonResult: %r", result)
-    return (False, unreachable_count)
+    return (False, bad_since)
 
 
 def reactor_loop(
     *,
     kill_on_reject: bool = True,
     dry_run: bool = False,
-    unreachable_limit: int = UNREACHABLE_ESCALATION_DEFAULT,
+    grace_seconds: float = GRACE_SECONDS_DEFAULT,
     event_source: Optional[Iterator[str]] = None,
+    now_fn=time.monotonic,
 ) -> None:
-    """Main loop. Subscribes to events, verifies on each, reacts."""
+    """Main loop. Subscribes to events, verifies on each, reacts.
+
+    `now_fn` is injectable so tests can drive the wall-clock grace
+    window deterministically.
+    """
     if event_source is None:
         event_source = _iter_log_stream()
 
     last_reaction_at = 0.0
-    consecutive_unreachable = 0
+    # Monotonic time the current unbroken bad streak began; None when
+    # the last observed substrate state was good (or never-yet-bad).
+    bad_since: Optional[float] = None
 
     for line in event_source:
         if not _matches_auth_event(line):
             continue
 
         log.debug("auth event: %s", line[:200])
-        now = time.monotonic()
+        now = now_fn()
         if now - last_reaction_at < REACTION_THROTTLE_S:
             log.debug("throttled — last reaction %.1fs ago",
                       now - last_reaction_at)
@@ -211,19 +254,13 @@ def reactor_loop(
         result = verify_lavalamp_substrate()
         log.info("verify result: %s", result.name)
 
-        # Log substrate recovery (informational; not a reaction).
-        if consecutive_unreachable > 0 and result not in (
-            DaemonResult.TIMEOUT, DaemonResult.UNREACHABLE,
-        ):
-            log.info("substrate reachable again after %d consecutive misses",
-                     consecutive_unreachable)
-
-        fired, consecutive_unreachable = _dispatch_reaction(
+        fired, bad_since = _dispatch_reaction(
             result,
             kill=kill_on_reject,
             dry_run=dry_run,
-            unreachable_count=consecutive_unreachable,
-            unreachable_limit=unreachable_limit,
+            now=now,
+            bad_since=bad_since,
+            grace_seconds=grace_seconds,
         )
         if fired:
             last_reaction_at = now
@@ -255,16 +292,17 @@ def main() -> int:
         help="On REJECT, lock screen only; do NOT kill the GUI session.",
     )
     parser.add_argument(
-        "--unreachable-limit", type=int,
-        default=int(os.environ.get(
-            "LL_REACTOR_UNREACHABLE_LIMIT",
-            str(UNREACHABLE_ESCALATION_DEFAULT),
+        "--grace-seconds", type=float,
+        default=float(os.environ.get(
+            "LL_REACTOR_GRACE_SECONDS",
+            str(GRACE_SECONDS_DEFAULT),
         )),
         help=(
-            "Consecutive UNREACHABLE/TIMEOUT events before escalating "
-            f"to a REJECT-equivalent reaction. Default: "
-            f"{UNREACHABLE_ESCALATION_DEFAULT}. Set to a very large "
-            "number (e.g. 10000) to effectively disable escalation."
+            "Seconds the substrate must be CONTINUOUSLY bad "
+            "(REJECT/STALE/UNREACHABLE/TIMEOUT) before the lock+kill "
+            f"reaction fires. Default: {GRACE_SECONDS_DEFAULT:.0f}. Any "
+            "ACCEPT resets the timer; BAD_SIG bypasses it. Set very "
+            "large (e.g. 86400) to keep observing without ever locking."
         ),
     )
     parser.add_argument(
@@ -289,15 +327,14 @@ def main() -> int:
         )
         return 2
 
-    if args.unreachable_limit < 1:
-        log.error("--unreachable-limit must be ≥ 1 (got %d)",
-                  args.unreachable_limit)
+    if args.grace_seconds <= 0:
+        log.error("--grace-seconds must be > 0 (got %s)", args.grace_seconds)
         return 2
 
     log.info(
         "starting PharOS reactor — PH-019 MVP-1 (log stream source); "
-        "dry_run=%s, kill_on_reject=%s, unreachable_limit=%d",
-        args.dry_run, not args.no_kill, args.unreachable_limit,
+        "dry_run=%s, kill_on_reject=%s, grace_seconds=%.0f",
+        args.dry_run, not args.no_kill, args.grace_seconds,
     )
     _install_signal_handlers()
 
@@ -305,7 +342,7 @@ def main() -> int:
         reactor_loop(
             kill_on_reject=not args.no_kill,
             dry_run=args.dry_run,
-            unreachable_limit=args.unreachable_limit,
+            grace_seconds=args.grace_seconds,
         )
     except KeyboardInterrupt:
         log.info("interrupted — exiting")
